@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+YBA_ROOT=${YBA_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+export YBA_ROOT
+
+# shellcheck source=../lib/common.sh
+. "$YBA_ROOT/lib/common.sh"
+# shellcheck source=../lib/ssh.sh
+. "$YBA_ROOT/lib/ssh.sh"
+# shellcheck source=../lib/cgroup.sh
+. "$YBA_ROOT/lib/cgroup.sh"
+# shellcheck source=../lib/ycsb.sh
+. "$YBA_ROOT/lib/ycsb.sh"
+# shellcheck source=../lib/metrics.sh
+. "$YBA_ROOT/lib/metrics.sh"
+# shellcheck source=../lib/report.sh
+. "$YBA_ROOT/lib/report.sh"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  yba preflight --config <file>
+  yba run --config <file>
+  yba summarize --experiment-dir <dir>
+  yba cleanup --config <file>
+
+Environment variables override values loaded from --config.
+EOF
+}
+
+command=${1:-}
+if [ -z "$command" ] || [ "$command" = "--help" ] || [ "$command" = "-h" ]; then
+    usage
+    exit 0
+fi
+shift || true
+
+config_file=
+experiment_dir_arg=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --config)
+            config_file=${2:-}
+            shift 2
+            ;;
+        --experiment-dir)
+            experiment_dir_arg=${2:-}
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            yba_die "unknown argument: $1"
+            ;;
+    esac
+done
+
+case "$command" in
+    preflight|run|cleanup)
+        [ -n "$config_file" ] || yba_die "--config is required for $command"
+        yba_load_config "$config_file"
+        yba_apply_defaults
+        ;;
+    summarize)
+        [ -n "$experiment_dir_arg" ] || yba_die "--experiment-dir is required for summarize"
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac
+
+case "$command" in
+    preflight)
+        yba_preflight
+        ;;
+    run)
+        yba_run
+        ;;
+    summarize)
+        yba_summarize "$experiment_dir_arg"
+        ;;
+    cleanup)
+        yba_cleanup
+        ;;
+esac

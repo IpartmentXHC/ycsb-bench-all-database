@@ -1,0 +1,9 @@
+experiments/
+*.log
+*.pid
+*.tmp
+*.db3
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
