@@ -145,7 +145,18 @@ CLIENT_CPUSET_EXPECT=96-127
 CLIENT_MEMS_EXPECT=3
 ```
 
-`preflight` 会检查 effective CPU 和 memory node 列表。运行过程中，服务端 PID 和 YCSB client shell 会被迁移到对应 cgroup，并保存 `/proc/<pid>/status` 快照。
+默认情况下，`preflight` 只检查 effective CPU 和 memory node 列表，不改 cgroup。如果当前用户已经拥有委托子树写权限，可以开启自动配置：
+
+```bash
+CGROUP_AUTO_CONFIG=1
+CGROUP_WRITE_WITH_SUDO=0
+SERVER_CPUSET_EXPECT=0-63
+SERVER_MEMS_EXPECT=0-1
+CLIENT_CPUSET_EXPECT=64-127
+CLIENT_MEMS_EXPECT=2-3
+```
+
+上例表示 Doris 使用 node0-1，YCSB 使用 node2-3。开启后，`preflight` / `run` 会尝试写入 `cpuset.cpus` 和 `cpuset.mems`，再检查 effective 值。如果当前用户不能写，工具会报错并打印 root 侧创建、授权和 cpuset 配置建议。运行过程中，服务端 PID 和 YCSB client shell 会被迁移到对应 cgroup，并保存 `/proc/<pid>/status` 快照。
 
 如果写入 cgroup 需要 sudo：
 
@@ -374,7 +385,18 @@ CLIENT_CPUSET_EXPECT=96-127
 CLIENT_MEMS_EXPECT=3
 ```
 
-`preflight` checks effective CPU and memory node lists. During a run, server PIDs and YCSB client shells are moved into their configured cgroups and `/proc/<pid>/status` snapshots are saved.
+By default, `preflight` only checks effective CPU and memory node lists. If the current user owns the delegated cgroup subtree, enable automatic cpuset configuration:
+
+```bash
+CGROUP_AUTO_CONFIG=1
+CGROUP_WRITE_WITH_SUDO=0
+SERVER_CPUSET_EXPECT=0-63
+SERVER_MEMS_EXPECT=0-1
+CLIENT_CPUSET_EXPECT=64-127
+CLIENT_MEMS_EXPECT=2-3
+```
+
+This example places Doris on node0-1 and YCSB on node2-3. With auto config enabled, `preflight` / `run` writes `cpuset.cpus` and `cpuset.mems`, then verifies effective values. If the current user cannot write the subtree, the tool fails with recommended root-side setup and delegation commands. During a run, server PIDs and YCSB client shells are moved into their configured cgroups and `/proc/<pid>/status` snapshots are saved.
 
 If cgroup writes require sudo, set:
 

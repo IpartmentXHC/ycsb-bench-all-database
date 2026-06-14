@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import csv
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -86,6 +87,47 @@ printf 'client_rsync=%s\\n' "$(yba_rsync_rsh_for_host "$CLIENT_HOST")"
         self.assertIn("client=ssh -o Global=yes -F /tmp/client_config -p 22197", result.stdout)
         self.assertIn("server_rsync=ssh -o Global=yes -F /tmp/server_config -p 22183", result.stdout)
         self.assertIn("client_rsync=ssh -o Global=yes -F /tmp/client_config -p 22197", result.stdout)
+
+    def test_cgroup_auto_config_writes_expected_cpuset_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "doris-bench"
+            server = root / "doris"
+            client = root / "ycsb"
+            for directory in (root, server, client):
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / "cpuset.cpus").write_text("", encoding="utf-8")
+                (directory / "cpuset.mems").write_text("", encoding="utf-8")
+            (root / "cgroup.controllers").write_text("cpuset memory\n", encoding="utf-8")
+            (root / "cgroup.subtree_control").write_text("", encoding="utf-8")
+
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/cgroup.sh"
+ENABLE_CGROUP=1
+CGROUP_AUTO_CONFIG=1
+CGROUP_WRITE_WITH_SUDO=0
+CGROUP_ROOT={str(root)!r}
+SERVER_CGROUP={str(server)!r}
+CLIENT_CGROUP={str(client)!r}
+SERVER_CPUSET_EXPECT=0-63
+SERVER_MEMS_EXPECT=0-1
+CLIENT_CPUSET_EXPECT=64-127
+CLIENT_MEMS_EXPECT=2-3
+yba_apply_defaults
+yba_preflight_cgroup
+printf 'server_cpus=%s\\n' "$(cat "$SERVER_CGROUP/cpuset.cpus")"
+printf 'server_mems=%s\\n' "$(cat "$SERVER_CGROUP/cpuset.mems")"
+printf 'client_cpus=%s\\n' "$(cat "$CLIENT_CGROUP/cpuset.cpus")"
+printf 'client_mems=%s\\n' "$(cat "$CLIENT_CGROUP/cpuset.mems")"
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("server_cpus=0-63", result.stdout)
+            self.assertIn("server_mems=0-1", result.stdout)
+            self.assertIn("client_cpus=64-127", result.stdout)
+            self.assertIn("client_mems=2-3", result.stdout)
 
 
 if __name__ == "__main__":
