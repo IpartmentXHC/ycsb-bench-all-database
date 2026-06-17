@@ -263,6 +263,7 @@ yba_prepare_local() {
     mkdir -p "$EXPERIMENT_DIR"
     yba_write_jdbc_props
     yba_write_workload
+    yba_preflight_cgroup
     yba_setup_server
 }
 

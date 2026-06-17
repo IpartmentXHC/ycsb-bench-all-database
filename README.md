@@ -158,12 +158,14 @@ CLIENT_MEMS_EXPECT=2-3
 
 上例表示 Doris 使用 node0-1，YCSB 使用 node2-3。开启后，`preflight` / `run` 会尝试写入 `cpuset.cpus` 和 `cpuset.mems`，再检查 effective 值。如果当前用户不能写，工具会报错并打印 root 侧创建、授权和 cpuset 配置建议。运行过程中，服务端 PID 和 YCSB client shell 会被迁移到对应 cgroup，并保存 `/proc/<pid>/status` 快照。
 
-如果写入 cgroup 需要 sudo：
+`CGROUP_WRITE_WITH_SUDO` 只控制 `cpuset.cpus` / `cpuset.mems` 写入。cgroup v2 的进程迁移写的是 `cgroup.procs`，可能需要单独的权限；如果 `preflight` 报 `cannot move pid ... cgroup.procs`，开启：
 
 ```bash
-CGROUP_WRITE_WITH_SUDO=1
+CGROUP_PROCS_WRITE_WITH_SUDO=1
 SUDO_ASKPASS=/path/to/askpass.sh
 ```
+
+如果 cpuset 配置本身也需要 sudo，再同时设置 `CGROUP_WRITE_WITH_SUDO=1`。
 
 ### SSH 与跳板机
 
@@ -398,12 +400,14 @@ CLIENT_MEMS_EXPECT=2-3
 
 This example places Doris on node0-1 and YCSB on node2-3. With auto config enabled, `preflight` / `run` writes `cpuset.cpus` and `cpuset.mems`, then verifies effective values. If the current user cannot write the subtree, the tool fails with recommended root-side setup and delegation commands. During a run, server PIDs and YCSB client shells are moved into their configured cgroups and `/proc/<pid>/status` snapshots are saved.
 
-If cgroup writes require sudo, set:
+`CGROUP_WRITE_WITH_SUDO` only controls `cpuset.cpus` / `cpuset.mems` writes. cgroup v2 process migration writes `cgroup.procs` and may require separate permission. If `preflight` reports `cannot move pid ... cgroup.procs`, enable:
 
 ```bash
-CGROUP_WRITE_WITH_SUDO=1
+CGROUP_PROCS_WRITE_WITH_SUDO=1
 SUDO_ASKPASS=/path/to/askpass.sh
 ```
+
+If cpuset configuration also requires sudo, set `CGROUP_WRITE_WITH_SUDO=1` as well.
 
 ### SSH and Jump Hosts
 

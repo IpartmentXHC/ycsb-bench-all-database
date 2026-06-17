@@ -4,15 +4,45 @@ yba_cgroup_write_pid() {
     local pid=$1
     local cgroup=$2
     [ -d "$cgroup" ] || yba_die "missing cgroup: $cgroup"
-    if [ "$CGROUP_WRITE_WITH_SUDO" = "1" ]; then
+    local err
+    err=$(mktemp)
+    if [ "$CGROUP_PROCS_WRITE_WITH_SUDO" = "1" ]; then
         if [ -n "$SUDO_ASKPASS" ]; then
-            printf '%s\n' "$pid" | SUDO_ASKPASS="$SUDO_ASKPASS" sudo -A tee "$cgroup/cgroup.procs" >/dev/null
+            if ! printf '%s\n' "$pid" | SUDO_ASKPASS="$SUDO_ASKPASS" sudo -A tee "$cgroup/cgroup.procs" >/dev/null 2>"$err"; then
+                yba_cgroup_pid_write_hint "$pid" "$cgroup" "$err"
+                rm -f "$err"
+                return 1
+            fi
         else
-            printf '%s\n' "$pid" | sudo tee "$cgroup/cgroup.procs" >/dev/null
+            if ! printf '%s\n' "$pid" | sudo tee "$cgroup/cgroup.procs" >/dev/null 2>"$err"; then
+                yba_cgroup_pid_write_hint "$pid" "$cgroup" "$err"
+                rm -f "$err"
+                return 1
+            fi
         fi
     else
-        printf '%s\n' "$pid" > "$cgroup/cgroup.procs"
+        if ! printf '%s\n' "$pid" > "$cgroup/cgroup.procs" 2>"$err"; then
+            yba_cgroup_pid_write_hint "$pid" "$cgroup" "$err"
+            rm -f "$err"
+            return 1
+        fi
     fi
+    rm -f "$err"
+}
+
+yba_cgroup_pid_write_hint() {
+    local pid=$1
+    local cgroup=$2
+    local err=$3
+    cat >&2 <<EOF
+ERROR: cannot move pid $pid into $cgroup/cgroup.procs as $(id -un).
+$(cat "$err" 2>/dev/null || true)
+This usually means cpuset files are writable, but cgroup v2 process migration is not delegated for this session.
+Try one of:
+  CGROUP_PROCS_WRITE_WITH_SUDO=1
+  run the benchmark from a shell already inside a delegated child cgroup
+  ask root to delegate the common ancestor cgroup.procs permission for this subtree
+EOF
 }
 
 yba_verify_proc_allowed() {
@@ -137,6 +167,21 @@ yba_preflight_cgroup() {
     if [ -n "$CLIENT_MEMS_EXPECT" ]; then
         [ "$(yba_cgroup_value "$CLIENT_CGROUP" cpuset.mems)" = "$CLIENT_MEMS_EXPECT" ] || yba_die "unexpected client mems"
     fi
+    yba_smoke_test_cgroup_procs "$CLIENT_CGROUP"
+}
+
+yba_smoke_test_cgroup_procs() {
+    [ "$CGROUP_PROCS_SMOKE_TEST" = "1" ] || return 0
+    local cgroup=$1
+    sleep 30 &
+    local pid=$!
+    if ! yba_cgroup_write_pid "$pid" "$cgroup"; then
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        yba_die "cgroup.procs smoke test failed for $cgroup"
+    fi
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
 }
 
 yba_move_server_pids_to_cgroup() {

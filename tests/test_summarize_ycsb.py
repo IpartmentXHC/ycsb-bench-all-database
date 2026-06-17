@@ -129,6 +129,52 @@ printf 'client_mems=%s\\n' "$(cat "$CLIENT_CGROUP/cpuset.mems")"
             self.assertIn("client_cpus=64-127", result.stdout)
             self.assertIn("client_mems=2-3", result.stdout)
 
+    def test_cgroup_pid_write_failure_reports_permission_hint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cgroup = Path(tmp) / "doris"
+            cgroup.mkdir()
+            procs = cgroup / "cgroup.procs"
+            procs.write_text("", encoding="utf-8")
+            procs.chmod(0o400)
+
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/cgroup.sh"
+CGROUP_PROCS_WRITE_WITH_SUDO=0
+CGROUP_WRITE_WITH_SUDO=0
+yba_apply_defaults
+yba_cgroup_write_pid $$ {str(cgroup)!r}
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cannot move pid", result.stderr)
+            self.assertIn("CGROUP_PROCS_WRITE_WITH_SUDO=1", result.stderr)
+
+    def test_cgroup_procs_write_uses_separate_sudo_switch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "sudo-marker.txt"
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/cgroup.sh"
+CGROUP_WRITE_WITH_SUDO=0
+CGROUP_PROCS_WRITE_WITH_SUDO=1
+SUDO_ASKPASS=/tmp/askpass
+yba_apply_defaults
+declare -f sudo >/dev/null 2>&1 && unset -f sudo
+sudo() {{
+  printf 'sudo_args=%s\\n' "$*" > {str(marker)!r}
+  cat >/dev/null
+}}
+yba_cgroup_write_pid 123 /tmp
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(marker.read_text(encoding="utf-8").strip(), "sudo_args=-A tee /tmp/cgroup.procs")
+
 
 if __name__ == "__main__":
     unittest.main()
