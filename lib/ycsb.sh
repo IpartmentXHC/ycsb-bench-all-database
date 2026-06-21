@@ -29,7 +29,11 @@ yba_preflight_host_basic() {
 yba_preflight_host_ycsb() {
     local host=$1
     yba_preflight_host_basic "$host"
-    yba_host_run "$host" "set -e; test -x $(yba_quote "$YCSB_HOME/bin/ycsb"); test -f $(yba_quote "$JDBC_JAR")"
+    local python_env=
+    if [ -n "$PYTHON2_LD_LIBRARY_PATH" ]; then
+        python_env="LD_LIBRARY_PATH=$(yba_quote "$PYTHON2_LD_LIBRARY_PATH")\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH} "
+    fi
+    yba_host_run "$host" "set -e; test -x $(yba_quote "$YCSB_HOME/bin/ycsb"); test -f $(yba_quote "$JDBC_JAR"); ${python_env}$(yba_quote "$PYTHON2_BIN") -V >/dev/null"
 }
 
 yba_remote_source_common() {
@@ -163,9 +167,25 @@ yba_setup_server() {
     if [ "$ENABLE_CGROUP" = "1" ]; then
         yba_move_server_pids_to_cgroup
     fi
+    yba_wait_server_ready
+}
+
+yba_wait_server_ready() {
     if [ -n "$SERVER_READY_CMD" ]; then
         yba_log "server ready check"
-        bash -lc "$SERVER_READY_CMD"
+        local start now elapsed
+        start=$(date +%s)
+        while true; do
+            if bash -lc "$SERVER_READY_CMD"; then
+                return 0
+            fi
+            now=$(date +%s)
+            elapsed=$((now - start))
+            if [ "$elapsed" -ge "$SERVER_READY_TIMEOUT" ]; then
+                yba_die "server ready check timed out after ${SERVER_READY_TIMEOUT}s: $SERVER_READY_CMD"
+            fi
+            sleep "$SERVER_READY_INTERVAL"
+        done
     fi
 }
 

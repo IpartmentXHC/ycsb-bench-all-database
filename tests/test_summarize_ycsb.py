@@ -320,6 +320,15 @@ test -n "$MATRIX"
                 result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 self.assertEqual(result.returncode, 0, f"{example}: {result.stderr}")
 
+    def test_singlehost_baseline_config_sets_python2_library_path(self):
+        script = f"""
+set -euo pipefail
+source {str(ROOT / "examples" / "doris" / "singlehost-baseline.env")!r}
+test "$PYTHON2_LD_LIBRARY_PATH" = /usr/local/python2.7/lib
+"""
+        result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_remote_env_prefix_exports_database_settings(self):
         script = f"""
 set -euo pipefail
@@ -337,6 +346,126 @@ yba_remote_env_prefix
         self.assertIn("DB_TYPE=doris", result.stdout)
         self.assertIn("DORIS_HOME=/opt/doris", result.stdout)
         self.assertIn("DORIS_SWAPOFF_WITH_SUDO=1", result.stdout)
+
+    def test_ycsb_preflight_uses_python2_library_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ycsb_home = Path(tmp) / "ycsb"
+            (ycsb_home / "bin").mkdir(parents=True)
+            (ycsb_home / "lib").mkdir()
+            ycsb_bin = ycsb_home / "bin" / "ycsb"
+            ycsb_bin.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+            ycsb_bin.chmod(0o755)
+            jar = ycsb_home / "lib" / "mysql.jar"
+            jar.write_text("", encoding="utf-8")
+            marker = Path(tmp) / "python2-env.txt"
+            fakebin = Path(tmp) / "bin"
+            fakebin.mkdir()
+            python2 = fakebin / "python2"
+            python2.write_text(
+                f"#!/usr/bin/env bash\nprintf '%s\\n' \"$LD_LIBRARY_PATH\" > {str(marker)!r}\n",
+                encoding="utf-8",
+            )
+            python2.chmod(0o755)
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/ssh.sh"
+source "$YBA_ROOT/lib/ycsb.sh"
+PATH={str(fakebin)!r}:$PATH
+YCSB_HOME={str(ycsb_home)!r}
+JDBC_JAR={str(jar)!r}
+PYTHON2_BIN=python2
+PYTHON2_LD_LIBRARY_PATH=/custom/python/lib
+yba_apply_defaults
+yba_preflight_host_ycsb localhost
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(marker.read_text(encoding="utf-8").strip(), "/custom/python/lib")
+
+    def test_start_metrics_detaches_background_sampler_stdio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/metrics.sh"
+EXPERIMENT_DIR={str(Path(tmp) / "exp")!r}
+RUN_SECONDS=5
+ENABLE_NODE_CPU_SAMPLER=1
+ENABLE_VMSTAT=0
+ENABLE_NUMASTAT=0
+yba_apply_defaults
+yba_start_metrics {str(run_dir)!r} >/tmp/yba-metrics-stdout.txt 2>/tmp/yba-metrics-stderr.txt
+test -f {str(run_dir / "metrics" / "cpu-sampler.pid")!r}
+sleep 1
+yba_stop_metrics {str(run_dir)!r}
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_ready_timeout_defaults_to_120_seconds(self):
+        script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+yba_apply_defaults
+printf '%s\\n' "$SERVER_READY_TIMEOUT"
+"""
+        result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "120")
+
+    def test_default_doris_ready_command_preserves_select_query_quoting(self):
+        script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+yba_apply_defaults
+printf '%s\\n' "$SERVER_READY_CMD"
+"""
+        result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('-e "select 1"', result.stdout)
+
+    def test_wait_server_ready_retries_until_command_succeeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "attempts"
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/ycsb.sh"
+SERVER_READY_TIMEOUT=3
+SERVER_READY_INTERVAL=1
+READY_MARKER={str(marker)!r}
+export READY_MARKER
+SERVER_READY_CMD='count=0; [ -f "$READY_MARKER" ] && count=$(cat "$READY_MARKER"); count=$((count + 1)); echo "$count" > "$READY_MARKER"; [ "$count" -ge 2 ]'
+yba_apply_defaults
+yba_wait_server_ready
+cat "$READY_MARKER"
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip().splitlines()[-1], "2")
+
+    def test_wait_server_ready_fails_after_timeout(self):
+        script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/ycsb.sh"
+SERVER_READY_TIMEOUT=1
+SERVER_READY_INTERVAL=1
+SERVER_READY_CMD='exit 1'
+yba_apply_defaults
+yba_wait_server_ready
+"""
+        result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("server ready check timed out after 1s", result.stderr)
 
     def test_meta_common_uses_generic_server_artifact_dir(self):
         with tempfile.TemporaryDirectory() as tmp:

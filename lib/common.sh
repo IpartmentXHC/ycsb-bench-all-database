@@ -125,7 +125,7 @@ yba_apply_defaults() {
     DORIS_START_BE=${DORIS_START_BE:-$DORIS_HOME/be/bin/start_be.sh}
     DORIS_STOP_FE=${DORIS_STOP_FE:-$DORIS_HOME/fe/bin/stop_fe.sh}
     DORIS_STOP_BE=${DORIS_STOP_BE:-$DORIS_HOME/be/bin/stop_be.sh}
-    DORIS_READY_CMD=${DORIS_READY_CMD:-mysql -h127.0.0.1 -P9030 -uroot -e 'select 1'}
+    DORIS_READY_CMD=${DORIS_READY_CMD:-mysql -h127.0.0.1 -P9030 -uroot -e \"select 1\"}
     DORIS_SWAP_CHECK=${DORIS_SWAP_CHECK:-1}
     DORIS_SWAPOFF_WITH_SUDO=${DORIS_SWAPOFF_WITH_SUDO:-0}
     DORIS_PROC_SWAPS=${DORIS_PROC_SWAPS:-/proc/swaps}
@@ -154,6 +154,8 @@ yba_apply_defaults() {
     if [ -z "$SERVER_READY_CMD" ] && [ "$DB_TYPE" = "doris" ]; then
         SERVER_READY_CMD=$DORIS_READY_CMD
     fi
+    SERVER_READY_TIMEOUT=${SERVER_READY_TIMEOUT:-120}
+    SERVER_READY_INTERVAL=${SERVER_READY_INTERVAL:-2}
     CLEANUP_SERVER=${CLEANUP_SERVER:-1}
     if [ -z "${SERVER_WARNING_LOG_GLOB+x}" ] && [ "$DB_TYPE" = "doris" ]; then
         SERVER_WARNING_LOG_GLOB="$DORIS_HOME/be/log/be*.log"

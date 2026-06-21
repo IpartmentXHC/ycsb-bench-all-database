@@ -4,12 +4,15 @@ yba_start_metrics() {
     local dir=$1
     mkdir -p "$dir/metrics"
     if [ "$ENABLE_NODE_CPU_SAMPLER" = "1" ] && command -v python3 >/dev/null; then
-        python3 "$YBA_ROOT/tools/sample-node-cpu.py" --out "$dir/metrics/cpu-node-samples.csv" --interval 1 --max-seconds "$RUN_SECONDS" &
+        python3 "$YBA_ROOT/tools/sample-node-cpu.py" --out "$dir/metrics/cpu-node-samples.csv" --interval 1 --max-seconds "$RUN_SECONDS" \
+            > "$dir/metrics/cpu-sampler.log" 2>&1 &
         echo $! > "$dir/metrics/cpu-sampler.pid"
+        disown "$!" 2>/dev/null || true
     fi
     if [ "$ENABLE_VMSTAT" = "1" ] && command -v vmstat >/dev/null; then
         timeout "$RUN_SECONDS" vmstat 1 > "$dir/metrics/vmstat.log" 2>&1 &
         echo $! > "$dir/metrics/vmstat.pid"
+        disown "$!" 2>/dev/null || true
     fi
     if [ "$ENABLE_NUMASTAT" = "1" ] && command -v numastat >/dev/null; then
         local pid

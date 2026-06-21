@@ -60,6 +60,7 @@ DORIS_START_BE=$DORIS_HOME/be/bin/start_be.sh
 DORIS_STOP_FE=$DORIS_HOME/fe/bin/stop_fe.sh
 DORIS_STOP_BE=$DORIS_HOME/be/bin/stop_be.sh
 DORIS_READY_CMD="mysql -h127.0.0.1 -P9030 -uroot -e 'select 1'"
+SERVER_READY_TIMEOUT=120
 ```
 
 如果你的机器 Doris 安装路径不同，通常只需要改 `DORIS_HOME`。如需完全自定义启停流程，可以设置：
@@ -71,6 +72,8 @@ SERVER_CLEANUP_CMD='...'
 ```
 
 显式 hook 会覆盖 Doris 默认启停逻辑。
+
+`SERVER_READY_CMD` 会循环重试，默认最多等待 120 秒。超时后 yba 会中止本轮运行，不会继续启动 YCSB。
 
 默认 Doris PID 发现同时包含 BE 和 FE：
 
