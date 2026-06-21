@@ -10,6 +10,8 @@ export YBA_ROOT
 . "$YBA_ROOT/lib/ssh.sh"
 # shellcheck source=../lib/cgroup.sh
 . "$YBA_ROOT/lib/cgroup.sh"
+# shellcheck source=../lib/database.sh
+. "$YBA_ROOT/lib/database.sh"
 # shellcheck source=../lib/ycsb.sh
 . "$YBA_ROOT/lib/ycsb.sh"
 # shellcheck source=../lib/metrics.sh

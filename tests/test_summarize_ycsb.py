@@ -175,6 +175,186 @@ yba_cgroup_write_pid 123 /tmp
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(marker.read_text(encoding="utf-8").strip(), "sudo_args=-A tee /tmp/cgroup.procs")
 
+    def test_cgroup_role_preflight_checks_only_requested_side(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "doris-bench"
+            server = root / "doris"
+            client = root / "ycsb"
+            for directory in (root, server, client):
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / "cpuset.cpus").write_text("", encoding="utf-8")
+                (directory / "cpuset.mems").write_text("", encoding="utf-8")
+            (root / "cgroup.controllers").write_text("cpuset memory\n", encoding="utf-8")
+            (root / "cgroup.subtree_control").write_text("", encoding="utf-8")
+
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/cgroup.sh"
+ENABLE_CGROUP=1
+CGROUP_AUTO_CONFIG=1
+CGROUP_WRITE_WITH_SUDO=0
+CGROUP_PROCS_SMOKE_TEST=0
+CGROUP_ROOT={str(root)!r}
+SERVER_CGROUP={str(server)!r}
+CLIENT_CGROUP=/missing/client/cgroup
+SERVER_CPUSET_EXPECT=0-63
+SERVER_MEMS_EXPECT=0-1
+CLIENT_CPUSET_EXPECT=64-127
+CLIENT_MEMS_EXPECT=2-3
+yba_apply_defaults
+yba_preflight_cgroup_role server
+printf 'server_cpus=%s\\n' "$(cat "$SERVER_CGROUP/cpuset.cpus")"
+printf 'server_mems=%s\\n' "$(cat "$SERVER_CGROUP/cpuset.mems")"
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("server_cpus=0-63", result.stdout)
+            self.assertIn("server_mems=0-1", result.stdout)
+
+    def test_doris_swap_check_requires_explicit_sudo_when_swap_is_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            swaps = Path(tmp) / "swaps"
+            swaps.write_text(
+                "Filename\tType\tSize\tUsed\tPriority\n/swapfile\tfile\t1024\t0\t-2\n",
+                encoding="utf-8",
+            )
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/database.sh"
+DORIS_PROC_SWAPS={str(swaps)!r}
+DORIS_SWAPOFF_WITH_SUDO=0
+yba_apply_defaults
+yba_doris_check_swap
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("swap is enabled", result.stderr)
+            self.assertIn("sudo swapoff -a", result.stderr)
+
+    def test_doris_swapoff_with_sudo_uses_askpass_when_configured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            swaps = Path(tmp) / "swaps"
+            marker = Path(tmp) / "sudo-marker.txt"
+            swaps.write_text(
+                "Filename\tType\tSize\tUsed\tPriority\n/swapfile\tfile\t1024\t0\t-2\n",
+                encoding="utf-8",
+            )
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/database.sh"
+DORIS_PROC_SWAPS={str(swaps)!r}
+DORIS_SWAPOFF_WITH_SUDO=1
+SUDO_ASKPASS=/tmp/askpass
+yba_apply_defaults
+declare -f sudo >/dev/null 2>&1 && unset -f sudo
+sudo() {{
+  printf 'sudo_args=%s\\n' "$*" > {str(marker)!r}
+}}
+yba_doris_check_swap
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(marker.read_text(encoding="utf-8").strip(), "sudo_args=-A swapoff -a")
+
+    def test_doris_preflight_allows_custom_setup_without_bundled_scripts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            swaps = Path(tmp) / "swaps"
+            swaps.write_text("Filename\tType\tSize\tUsed\tPriority\n", encoding="utf-8")
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/database.sh"
+DB_TYPE=doris
+DORIS_HOME=/missing/doris
+DORIS_PROC_SWAPS={str(swaps)!r}
+SERVER_SETUP_CMD='echo custom setup'
+yba_apply_defaults
+yba_database_preflight_server
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_doris_defaults_include_be_and_fe_pid_discovery(self):
+        script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/database.sh"
+yba_apply_defaults
+printf '%s\\n' "$SERVER_PID_COMMAND"
+"""
+        result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("pgrep -x doris_be", result.stdout)
+        self.assertIn('org[.]apache[.]doris[.]DorisFE', result.stdout)
+
+    def test_new_doris_examples_are_sourceable_and_use_database_defaults(self):
+        examples = [
+            ROOT / "examples" / "doris" / "singlehost-baseline.env",
+            ROOT / "examples" / "doris" / "dualhost-baseline.env",
+            ROOT / "examples" / "doris" / "singlehost-cgroup2.env",
+            ROOT / "examples" / "doris" / "dualhost-cgroup2.env",
+            ROOT / "examples" / "doris" / "thread-cluster.env",
+        ]
+        for example in examples:
+            with self.subTest(example=example.name):
+                script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/database.sh"
+source {str(example)!r}
+yba_apply_defaults
+test "$DB_TYPE" = doris
+test -n "$DORIS_HOME"
+test -n "$JDBC_URL"
+test -n "$MATRIX"
+"""
+                result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                self.assertEqual(result.returncode, 0, f"{example}: {result.stderr}")
+
+    def test_remote_env_prefix_exports_database_settings(self):
+        script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/ssh.sh"
+DB_TYPE=doris
+DORIS_HOME=/opt/doris
+DORIS_SWAPOFF_WITH_SUDO=1
+yba_apply_defaults
+yba_remote_env_prefix
+"""
+        result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("DB_TYPE=doris", result.stdout)
+        self.assertIn("DORIS_HOME=/opt/doris", result.stdout)
+        self.assertIn("DORIS_SWAPOFF_WITH_SUDO=1", result.stdout)
+
+    def test_meta_common_uses_generic_server_artifact_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/ycsb.sh"
+EXPERIMENT_DIR={str(Path(tmp) / "exp")!r}
+ENABLE_CGROUP=0
+yba_apply_defaults
+yba_write_meta_common {str(run_dir)!r}
+test -d {str(run_dir / "server")!r}
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

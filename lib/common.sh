@@ -50,6 +50,7 @@ yba_load_config() {
 }
 
 yba_apply_defaults() {
+    DB_TYPE=${DB_TYPE:-doris}
     MODE=${MODE:-singlehost}
     SERVER_HOST=${SERVER_HOST:-localhost}
     CLIENT_HOST=${CLIENT_HOST:-$SERVER_HOST}
@@ -119,15 +120,46 @@ yba_apply_defaults() {
     CGROUP_PROCS_SMOKE_TEST=${CGROUP_PROCS_SMOKE_TEST:-1}
     SUDO_ASKPASS=${SUDO_ASKPASS:-}
 
+    DORIS_HOME=${DORIS_HOME:-/home/xhc/doris/apache-doris-2.1.2-bin-arm64}
+    DORIS_START_FE=${DORIS_START_FE:-$DORIS_HOME/fe/bin/start_fe.sh}
+    DORIS_START_BE=${DORIS_START_BE:-$DORIS_HOME/be/bin/start_be.sh}
+    DORIS_STOP_FE=${DORIS_STOP_FE:-$DORIS_HOME/fe/bin/stop_fe.sh}
+    DORIS_STOP_BE=${DORIS_STOP_BE:-$DORIS_HOME/be/bin/stop_be.sh}
+    DORIS_READY_CMD=${DORIS_READY_CMD:-mysql -h127.0.0.1 -P9030 -uroot -e 'select 1'}
+    DORIS_SWAP_CHECK=${DORIS_SWAP_CHECK:-1}
+    DORIS_SWAPOFF_WITH_SUDO=${DORIS_SWAPOFF_WITH_SUDO:-0}
+    DORIS_PROC_SWAPS=${DORIS_PROC_SWAPS:-/proc/swaps}
+
+    CLICKHOUSE_HOME=${CLICKHOUSE_HOME:-}
+
     ENABLE_THREAD_CLUSTER=${ENABLE_THREAD_CLUSTER:-0}
     THREAD_CLUSTER_RULES=${THREAD_CLUSTER_RULES:-}
-    SERVER_PID_COMMAND=${SERVER_PID_COMMAND:-pgrep -x doris_be}
+    if [ -z "${SERVER_PID_COMMAND+x}" ]; then
+        case "$DB_TYPE" in
+            doris)
+                SERVER_PID_COMMAND='pgrep -x doris_be; pgrep -f "org[.]apache[.]doris[.]DorisFE"'
+                ;;
+            clickhouse)
+                SERVER_PID_COMMAND='pgrep -x clickhouse-server'
+                ;;
+            *)
+                SERVER_PID_COMMAND='pgrep -x doris_be'
+                ;;
+        esac
+    fi
 
     SERVER_SETUP_CMD=${SERVER_SETUP_CMD:-}
     SERVER_CLEANUP_CMD=${SERVER_CLEANUP_CMD:-}
     SERVER_READY_CMD=${SERVER_READY_CMD:-}
+    if [ -z "$SERVER_READY_CMD" ] && [ "$DB_TYPE" = "doris" ]; then
+        SERVER_READY_CMD=$DORIS_READY_CMD
+    fi
     CLEANUP_SERVER=${CLEANUP_SERVER:-1}
-    SERVER_WARNING_LOG_GLOB=${SERVER_WARNING_LOG_GLOB:-}
+    if [ -z "${SERVER_WARNING_LOG_GLOB+x}" ] && [ "$DB_TYPE" = "doris" ]; then
+        SERVER_WARNING_LOG_GLOB="$DORIS_HOME/be/log/be*.log"
+    else
+        SERVER_WARNING_LOG_GLOB=${SERVER_WARNING_LOG_GLOB:-}
+    fi
 
     ENABLE_NODE_CPU_SAMPLER=${ENABLE_NODE_CPU_SAMPLER:-1}
     ENABLE_VMSTAT=${ENABLE_VMSTAT:-1}

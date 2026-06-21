@@ -129,6 +129,7 @@ yba_remote_env_prefix() {
     cat <<EOF
 YBA_ROOT=$(yba_quote "$REMOTE_ROOT") \
 REMOTE_MODE=1 \
+DB_TYPE=$(yba_quote "$DB_TYPE") \
 MODE=$(yba_quote "$MODE") \
 SERVER_HOST=$(yba_quote "$SERVER_HOST") \
 CLIENT_HOST=$(yba_quote "$CLIENT_HOST") \
@@ -175,6 +176,16 @@ SUDO_ASKPASS=$(yba_quote "$SUDO_ASKPASS") \
 ENABLE_THREAD_CLUSTER=$(yba_quote "$ENABLE_THREAD_CLUSTER") \
 THREAD_CLUSTER_RULES=$(yba_quote "$THREAD_CLUSTER_RULES") \
 SERVER_PID_COMMAND=$(yba_quote "$SERVER_PID_COMMAND") \
+DORIS_HOME=$(yba_quote "$DORIS_HOME") \
+DORIS_START_FE=$(yba_quote "$DORIS_START_FE") \
+DORIS_START_BE=$(yba_quote "$DORIS_START_BE") \
+DORIS_STOP_FE=$(yba_quote "$DORIS_STOP_FE") \
+DORIS_STOP_BE=$(yba_quote "$DORIS_STOP_BE") \
+DORIS_READY_CMD=$(yba_quote "$DORIS_READY_CMD") \
+DORIS_SWAP_CHECK=$(yba_quote "$DORIS_SWAP_CHECK") \
+DORIS_SWAPOFF_WITH_SUDO=$(yba_quote "$DORIS_SWAPOFF_WITH_SUDO") \
+DORIS_PROC_SWAPS=$(yba_quote "$DORIS_PROC_SWAPS") \
+CLICKHOUSE_HOME=$(yba_quote "$CLICKHOUSE_HOME") \
 SERVER_SETUP_CMD=$(yba_quote "$SERVER_SETUP_CMD") \
 SERVER_CLEANUP_CMD=$(yba_quote "$SERVER_CLEANUP_CMD") \
 SERVER_READY_CMD=$(yba_quote "$SERVER_READY_CMD") \

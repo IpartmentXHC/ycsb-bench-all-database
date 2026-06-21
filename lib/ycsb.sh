@@ -32,6 +32,12 @@ yba_preflight_host_ycsb() {
     yba_host_run "$host" "set -e; test -x $(yba_quote "$YCSB_HOME/bin/ycsb"); test -f $(yba_quote "$JDBC_JAR")"
 }
 
+yba_remote_source_common() {
+    cat <<'EOF'
+source "$YBA_ROOT/lib/common.sh"; source "$YBA_ROOT/lib/ssh.sh"; source "$YBA_ROOT/lib/cgroup.sh"; source "$YBA_ROOT/lib/database.sh"; source "$YBA_ROOT/lib/metrics.sh"; source "$YBA_ROOT/lib/report.sh"; source "$YBA_ROOT/lib/ycsb.sh"
+EOF
+}
+
 yba_preflight() {
     yba_log "preflight mode=$MODE server=$SERVER_HOST client=$CLIENT_HOST"
     case "$MODE" in
@@ -51,13 +57,15 @@ yba_preflight() {
         if [ "$MODE" = "dualhost" ] && [ "$CLIENT_HOST" != "$SERVER_HOST" ]; then
             yba_install_remote_tools "$CLIENT_HOST"
         fi
-        local cgroup_host=$SERVER_HOST
-        [ "$MODE" = "dualhost" ] && cgroup_host=$CLIENT_HOST
-        yba_host_run "$SERVER_HOST" "$(yba_remote_env_prefix) bash -lc 'source \"\$YBA_ROOT/lib/common.sh\"; source \"\$YBA_ROOT/lib/cgroup.sh\"; yba_preflight_cgroup'"
+        yba_host_run "$SERVER_HOST" "$(yba_remote_env_prefix) bash -lc 'source \"\$YBA_ROOT/lib/common.sh\"; source \"\$YBA_ROOT/lib/cgroup.sh\"; yba_preflight_cgroup_role server'"
         if [ "$MODE" = "dualhost" ] && [ "$CLIENT_HOST" != "$SERVER_HOST" ]; then
-            yba_host_run "$cgroup_host" "$(yba_remote_env_prefix) bash -lc 'source \"\$YBA_ROOT/lib/common.sh\"; source \"\$YBA_ROOT/lib/cgroup.sh\"; yba_preflight_cgroup'"
+            yba_host_run "$CLIENT_HOST" "$(yba_remote_env_prefix) bash -lc 'source \"\$YBA_ROOT/lib/common.sh\"; source \"\$YBA_ROOT/lib/cgroup.sh\"; yba_preflight_cgroup_role client'"
+        elif [ "$MODE" = "singlehost" ]; then
+            yba_host_run "$SERVER_HOST" "$(yba_remote_env_prefix) bash -lc 'source \"\$YBA_ROOT/lib/common.sh\"; source \"\$YBA_ROOT/lib/cgroup.sh\"; yba_preflight_cgroup_role client'"
         fi
     fi
+    yba_install_remote_tools "$SERVER_HOST"
+    yba_host_run "$SERVER_HOST" "$(yba_remote_env_prefix) bash -lc 'source \"\$YBA_ROOT/lib/common.sh\"; source \"\$YBA_ROOT/lib/database.sh\"; yba_apply_defaults; yba_database_preflight_server'"
     yba_log "preflight finished"
 }
 
@@ -94,7 +102,7 @@ EOF
 
 yba_write_meta_common() {
     local run_dir=$1
-    mkdir -p "$run_dir"/{meta,metrics/ycsb-raw,cgroup,thread-cluster,doris}
+    mkdir -p "$run_dir"/{meta,metrics/ycsb-raw,cgroup,thread-cluster,server}
     hostname > "$run_dir/meta/hostname.txt" 2>&1 || true
     uname -a > "$run_dir/meta/uname.txt" 2>&1 || true
     lscpu > "$run_dir/meta/lscpu.txt" 2>&1 || true
@@ -151,10 +159,7 @@ yba_server_pids() {
 }
 
 yba_setup_server() {
-    if [ -n "$SERVER_SETUP_CMD" ]; then
-        yba_log "server setup hook"
-        bash -lc "$SERVER_SETUP_CMD"
-    fi
+    yba_database_setup_server
     if [ "$ENABLE_CGROUP" = "1" ]; then
         yba_move_server_pids_to_cgroup
     fi
@@ -165,10 +170,7 @@ yba_setup_server() {
 }
 
 yba_cleanup_local() {
-    if [ "$CLEANUP_SERVER" = "1" ] && [ -n "$SERVER_CLEANUP_CMD" ]; then
-        yba_log "server cleanup hook"
-        bash -lc "$SERVER_CLEANUP_CMD" || true
-    fi
+    yba_database_cleanup_server
 }
 
 yba_run_ycsb_clients() {
@@ -223,7 +225,7 @@ yba_collect_server_logs() {
     if [ -n "$SERVER_WARNING_LOG_GLOB" ]; then
         # shellcheck disable=SC2086
         grep -Ei 'warn|error|exception|timeout|fail|memory|spill|connection' $SERVER_WARNING_LOG_GLOB 2>/dev/null |
-            tail -300 > "$run_dir/doris/server-warning.log" || true
+            tail -300 > "$run_dir/server/server-warning.log" || true
     fi
     local pid
     : > "$run_dir/meta/server-pids.txt"
@@ -263,7 +265,7 @@ yba_prepare_local() {
     mkdir -p "$EXPERIMENT_DIR"
     yba_write_jdbc_props
     yba_write_workload
-    yba_preflight_cgroup
+    yba_preflight_cgroup_role both
     yba_setup_server
 }
 
@@ -296,7 +298,7 @@ yba_run_remote_on() {
     REMOTE_EXPERIMENT_DIR="$REMOTE_ROOT/experiments/$(basename "$EXPERIMENT_DIR")"
     export REMOTE_EXPERIMENT_DIR
     yba_install_remote_tools "$host"
-    yba_host_run "$host" "$(yba_remote_env_prefix) bash -lc 'source \"\$YBA_ROOT/lib/common.sh\"; source \"\$YBA_ROOT/lib/ssh.sh\"; source \"\$YBA_ROOT/lib/cgroup.sh\"; source \"\$YBA_ROOT/lib/metrics.sh\"; source \"\$YBA_ROOT/lib/report.sh\"; source \"\$YBA_ROOT/lib/ycsb.sh\"; yba_apply_defaults; yba_run_local_matrix'"
+    yba_host_run "$host" "$(yba_remote_env_prefix) bash -lc '$(yba_remote_source_common); yba_apply_defaults; yba_run_local_matrix'"
     yba_fetch_results_from "$host"
 }
 
@@ -305,7 +307,7 @@ yba_run_dualhost() {
     export REMOTE_EXPERIMENT_DIR
     yba_install_remote_tools "$SERVER_HOST"
     yba_install_remote_tools "$CLIENT_HOST"
-    yba_host_run "$SERVER_HOST" "$(yba_remote_env_prefix) bash -lc 'source \"\$YBA_ROOT/lib/common.sh\"; source \"\$YBA_ROOT/lib/cgroup.sh\"; source \"\$YBA_ROOT/lib/ycsb.sh\"; source \"\$YBA_ROOT/lib/metrics.sh\"; yba_apply_defaults; yba_setup_server'"
+    yba_host_run "$SERVER_HOST" "$(yba_remote_env_prefix) bash -lc '$(yba_remote_source_common); yba_apply_defaults; yba_preflight_cgroup_role server; yba_setup_server'"
 
     local item label clients threads round rc=0
     for item in $MATRIX; do
@@ -315,13 +317,13 @@ EOF
         [ -n "$label" ] && [ -n "$clients" ] && [ -n "$threads" ] || yba_die "bad MATRIX item: $item"
         for round in $(seq 1 "$ROUNDS"); do
             yba_log "dualhost run label=$label round=$round clients=$clients threads/client=$threads"
-            yba_host_run "$SERVER_HOST" "$(yba_remote_env_prefix) bash -lc 'source \"\$YBA_ROOT/lib/common.sh\"; source \"\$YBA_ROOT/lib/cgroup.sh\"; source \"\$YBA_ROOT/lib/metrics.sh\"; source \"\$YBA_ROOT/lib/ycsb.sh\"; yba_apply_defaults; run_dir=\"\$EXPERIMENT_DIR/server/$(yba_quote "$label")/r$(yba_quote "$round")\"; rm -rf \"\$run_dir\"; yba_write_meta_common \"\$run_dir\"; yba_write_workload_meta \"\$run_dir\" $(yba_quote "$label") $(yba_quote "$clients") $(yba_quote "$threads"); yba_collect_server_logs \"\$run_dir\"; if [ \"\$ENABLE_CGROUP\" = 1 ]; then yba_snapshot_server_cgroup \"\$run_dir\"; fi; yba_apply_thread_cluster \"\$run_dir\"; yba_start_metrics \"\$run_dir\"'"
-            if yba_host_run "$CLIENT_HOST" "$(yba_remote_env_prefix) MODE=singlehost SERVER_HOST=$(yba_quote "$CLIENT_HOST") CLIENT_HOST=$(yba_quote "$CLIENT_HOST") ENABLE_THREAD_CLUSTER=0 SERVER_SETUP_CMD= SERVER_READY_CMD= SERVER_CLEANUP_CMD= bash -lc 'source \"\$YBA_ROOT/lib/common.sh\"; source \"\$YBA_ROOT/lib/ssh.sh\"; source \"\$YBA_ROOT/lib/cgroup.sh\"; source \"\$YBA_ROOT/lib/metrics.sh\"; source \"\$YBA_ROOT/lib/report.sh\"; source \"\$YBA_ROOT/lib/ycsb.sh\"; yba_apply_defaults; yba_prepare_local; yba_run_one_local $(yba_quote "$label") $(yba_quote "$clients") $(yba_quote "$threads") $(yba_quote "$round"); yba_summarize \"\$EXPERIMENT_DIR\" || true'"; then
+            yba_host_run "$SERVER_HOST" "$(yba_remote_env_prefix) bash -lc '$(yba_remote_source_common); yba_apply_defaults; run_dir=\"\$EXPERIMENT_DIR/server/$(yba_quote "$label")/r$(yba_quote "$round")\"; rm -rf \"\$run_dir\"; yba_write_meta_common \"\$run_dir\"; yba_write_workload_meta \"\$run_dir\" $(yba_quote "$label") $(yba_quote "$clients") $(yba_quote "$threads"); yba_collect_server_logs \"\$run_dir\"; if [ \"\$ENABLE_CGROUP\" = 1 ]; then yba_snapshot_server_cgroup \"\$run_dir\"; fi; yba_apply_thread_cluster \"\$run_dir\"; yba_start_metrics \"\$run_dir\"'"
+            if yba_host_run "$CLIENT_HOST" "$(yba_remote_env_prefix) MODE=singlehost SERVER_HOST=$(yba_quote "$CLIENT_HOST") CLIENT_HOST=$(yba_quote "$CLIENT_HOST") ENABLE_THREAD_CLUSTER=0 SERVER_SETUP_CMD= SERVER_READY_CMD= SERVER_CLEANUP_CMD= SERVER_PID_COMMAND= DB_TYPE=client-only bash -lc '$(yba_remote_source_common); yba_apply_defaults; mkdir -p \"\$EXPERIMENT_DIR\"; yba_write_jdbc_props; yba_write_workload; yba_preflight_cgroup_role client; yba_run_one_local $(yba_quote "$label") $(yba_quote "$clients") $(yba_quote "$threads") $(yba_quote "$round"); yba_summarize \"\$EXPERIMENT_DIR\" || true'"; then
                 :
             else
                 rc=1
             fi
-            yba_host_run "$SERVER_HOST" "$(yba_remote_env_prefix) bash -lc 'source \"\$YBA_ROOT/lib/common.sh\"; source \"\$YBA_ROOT/lib/metrics.sh\"; source \"\$YBA_ROOT/lib/ycsb.sh\"; yba_apply_defaults; run_dir=\"\$EXPERIMENT_DIR/server/$(yba_quote "$label")/r$(yba_quote "$round")\"; yba_stop_metrics \"\$run_dir\"; yba_collect_server_logs \"\$run_dir\"'" || true
+            yba_host_run "$SERVER_HOST" "$(yba_remote_env_prefix) bash -lc '$(yba_remote_source_common); yba_apply_defaults; run_dir=\"\$EXPERIMENT_DIR/server/$(yba_quote "$label")/r$(yba_quote "$round")\"; yba_stop_metrics \"\$run_dir\"; yba_collect_server_logs \"\$run_dir\"'" || true
             [ "$rc" = "0" ] || break 2
         done
     done
@@ -355,10 +357,10 @@ yba_cleanup() {
             yba_cleanup_local
         else
             yba_install_remote_tools "$SERVER_HOST"
-            yba_host_run "$SERVER_HOST" "$(yba_remote_env_prefix) bash -lc 'source \"\$YBA_ROOT/lib/common.sh\"; source \"\$YBA_ROOT/lib/ycsb.sh\"; yba_apply_defaults; yba_cleanup_local'"
+            yba_host_run "$SERVER_HOST" "$(yba_remote_env_prefix) bash -lc '$(yba_remote_source_common); yba_apply_defaults; yba_cleanup_local'"
         fi
     else
         yba_install_remote_tools "$SERVER_HOST"
-        yba_host_run "$SERVER_HOST" "$(yba_remote_env_prefix) bash -lc 'source \"\$YBA_ROOT/lib/common.sh\"; source \"\$YBA_ROOT/lib/ycsb.sh\"; yba_apply_defaults; yba_cleanup_local'"
+        yba_host_run "$SERVER_HOST" "$(yba_remote_env_prefix) bash -lc '$(yba_remote_source_common); yba_apply_defaults; yba_cleanup_local'"
     fi
 }

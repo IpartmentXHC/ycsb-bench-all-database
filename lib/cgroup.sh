@@ -150,24 +150,87 @@ yba_configure_cgroup_cpuset() {
     yba_configure_one_cpuset "$CLIENT_CGROUP" "$CLIENT_CPUSET_EXPECT" "$CLIENT_MEMS_EXPECT"
 }
 
+yba_configure_cgroup_cpuset_role() {
+    [ "$CGROUP_AUTO_CONFIG" = "1" ] || return 0
+    local role=$1
+    [ -d "$CGROUP_ROOT" ] || {
+        yba_cgroup_config_hint
+        yba_die "missing CGROUP_ROOT: $CGROUP_ROOT"
+    }
+    if [ -f "$CGROUP_ROOT/cgroup.subtree_control" ] && grep -qw cpuset "$CGROUP_ROOT/cgroup.controllers" 2>/dev/null; then
+        if ! grep -qw cpuset "$CGROUP_ROOT/cgroup.subtree_control" 2>/dev/null; then
+            yba_cgroup_write_file "$CGROUP_ROOT/cgroup.subtree_control" "+cpuset" || {
+                yba_cgroup_config_hint
+                yba_die "cannot enable cpuset in $CGROUP_ROOT/cgroup.subtree_control as $(id -un)"
+            }
+        fi
+    fi
+    case "$role" in
+        server)
+            yba_configure_one_cpuset "$SERVER_CGROUP" "$SERVER_CPUSET_EXPECT" "$SERVER_MEMS_EXPECT"
+            ;;
+        client)
+            yba_configure_one_cpuset "$CLIENT_CGROUP" "$CLIENT_CPUSET_EXPECT" "$CLIENT_MEMS_EXPECT"
+            ;;
+        both)
+            yba_configure_one_cpuset "$SERVER_CGROUP" "$SERVER_CPUSET_EXPECT" "$SERVER_MEMS_EXPECT"
+            yba_configure_one_cpuset "$CLIENT_CGROUP" "$CLIENT_CPUSET_EXPECT" "$CLIENT_MEMS_EXPECT"
+            ;;
+        *)
+            yba_die "unknown cgroup role: $role"
+            ;;
+    esac
+}
+
+yba_preflight_one_cgroup() {
+    local role=$1
+    local cgroup cpus mems
+    case "$role" in
+        server)
+            cgroup=$SERVER_CGROUP
+            cpus=$SERVER_CPUSET_EXPECT
+            mems=$SERVER_MEMS_EXPECT
+            ;;
+        client)
+            cgroup=$CLIENT_CGROUP
+            cpus=$CLIENT_CPUSET_EXPECT
+            mems=$CLIENT_MEMS_EXPECT
+            ;;
+        *)
+            yba_die "unknown cgroup role: $role"
+            ;;
+    esac
+    [ -d "$cgroup" ] || yba_die "missing ${role^^}_CGROUP: $cgroup"
+    if [ -n "$cpus" ]; then
+        [ "$(yba_cgroup_value "$cgroup" cpuset.cpus)" = "$cpus" ] || yba_die "unexpected $role cpuset"
+    fi
+    if [ -n "$mems" ]; then
+        [ "$(yba_cgroup_value "$cgroup" cpuset.mems)" = "$mems" ] || yba_die "unexpected $role mems"
+    fi
+    yba_smoke_test_cgroup_procs "$cgroup"
+}
+
+yba_preflight_cgroup_role() {
+    [ "$ENABLE_CGROUP" = "1" ] || return 0
+    local role=${1:-both}
+    yba_configure_cgroup_cpuset_role "$role"
+    case "$role" in
+        server|client)
+            yba_preflight_one_cgroup "$role"
+            ;;
+        both)
+            yba_preflight_one_cgroup server
+            yba_preflight_one_cgroup client
+            ;;
+        *)
+            yba_die "unknown cgroup role: $role"
+            ;;
+    esac
+}
+
 yba_preflight_cgroup() {
     [ "$ENABLE_CGROUP" = "1" ] || return 0
-    yba_configure_cgroup_cpuset
-    [ -d "$SERVER_CGROUP" ] || yba_die "missing SERVER_CGROUP: $SERVER_CGROUP"
-    [ -d "$CLIENT_CGROUP" ] || yba_die "missing CLIENT_CGROUP: $CLIENT_CGROUP"
-    if [ -n "$SERVER_CPUSET_EXPECT" ]; then
-        [ "$(yba_cgroup_value "$SERVER_CGROUP" cpuset.cpus)" = "$SERVER_CPUSET_EXPECT" ] || yba_die "unexpected server cpuset"
-    fi
-    if [ -n "$SERVER_MEMS_EXPECT" ]; then
-        [ "$(yba_cgroup_value "$SERVER_CGROUP" cpuset.mems)" = "$SERVER_MEMS_EXPECT" ] || yba_die "unexpected server mems"
-    fi
-    if [ -n "$CLIENT_CPUSET_EXPECT" ]; then
-        [ "$(yba_cgroup_value "$CLIENT_CGROUP" cpuset.cpus)" = "$CLIENT_CPUSET_EXPECT" ] || yba_die "unexpected client cpuset"
-    fi
-    if [ -n "$CLIENT_MEMS_EXPECT" ]; then
-        [ "$(yba_cgroup_value "$CLIENT_CGROUP" cpuset.mems)" = "$CLIENT_MEMS_EXPECT" ] || yba_die "unexpected client mems"
-    fi
-    yba_smoke_test_cgroup_procs "$CLIENT_CGROUP"
+    yba_preflight_cgroup_role both
 }
 
 yba_smoke_test_cgroup_procs() {

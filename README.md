@@ -1,202 +1,182 @@
 # ycsb-bench-all-database
 
-中文 | [English](#english)
+`ycsb-bench-all-database` 是面向 Doris 和 ClickHouse 的 YCSB 压测工具。当前主线优先服务 Doris：固定沉淀 `kunpen183` / `ubuntu197` 上的单机、双机、cgroup v2 cpuset 隔离和用户态线程聚集实验流程。ClickHouse 目前保留同样的配置骨架，等连接参数和启停方式明确后再补齐可直接运行的示例。
 
-## 中文
+工具仍然通过 JDBC/YCSB 执行 workload，但项目目标不再是“任意数据库通用压测框架”，而是把 Doris/ClickHouse 的可复现实验流程做稳。
 
-`ycsb-bench-all-database` 是一个 Bash CLI，用于可复现地运行 JDBC/YCSB 数据库压测。它把 Doris/YCSB 实验中沉淀出的流程固化为配置驱动工具，包括单机测试、双机测试、cgroup v2 cpuset 隔离、用户态线程聚集、多 YCSB client 并发、NUMA node CPU 采样、原始日志归档，以及 CSV/Markdown 汇总报告。
-
-第一版刻意保持轻依赖：
-
-- 配置文件使用 shell env 格式。
-- 数据库接口抽象为通用 JDBC。
-- Doris 通过示例配置和 `SERVER_SETUP_CMD` / `SERVER_CLEANUP_CMD` hook 支持。
-- cgroup v2 只负责检查、迁移和验证；root 级挂载、授权和子树创建由用户提前完成。
-
-### 目录结构
-
-```text
-ycsb-bench-all-database/
-  bin/yba
-  lib/
-  tools/
-  examples/
-  experiments/
-```
-
-### CLI
+## Quick Start
 
 ```bash
-./bin/yba preflight --config examples/singlehost-cgroup2.env
-./bin/yba run --config examples/singlehost-cgroup2.env
+cd /data/sched-ext-study/ycsb-bench-all-database
+
+./bin/yba preflight --config examples/doris/singlehost-baseline.env
+./bin/yba run --config examples/doris/singlehost-baseline.env
 ./bin/yba summarize --experiment-dir experiments/<run>
-./bin/yba cleanup --config examples/singlehost-cgroup2.env
+./bin/yba cleanup --config examples/doris/singlehost-baseline.env
 ```
 
 命令行环境变量会覆盖配置文件中的值：
 
 ```bash
-MATRIX="t1:1:1" OPERATIONCOUNT_PER_CLIENT=1000 \
-  ./bin/yba run --config examples/dualhost-doris.env
+MATRIX='t80:5:16' OPERATIONCOUNT_PER_CLIENT=50000 \
+  ./bin/yba run --config examples/doris/dualhost-baseline.env
 ```
 
-### 运行模式
+`MATRIX` 格式为 `label:client_processes:threads_per_client`。例如 `t80:5:16` 表示 5 个 YCSB JVM，每个 16 线程，总 80 client 线程。
 
-#### 单机模式
+## Doris Scenarios
 
-`MODE=singlehost` 会在 `SERVER_HOST` 上执行服务端 hook，并在同一台机器上启动 YCSB client。该模式适合 cgroup v2 资源隔离场景，例如 Doris 使用 NUMA node0-2，YCSB 使用 node3。
+四个基础场景已经固化为 Doris 示例：
+
+| 场景 | 配置 | 说明 |
+| --- | --- | --- |
+| 单机 baseline | `examples/doris/singlehost-baseline.env` | Doris 和 YCSB 同机，无 cgroup 限制 |
+| 双机 baseline | `examples/doris/dualhost-baseline.env` | Doris 在 `kunpen183`，YCSB 在 `ubuntu197` |
+| 单机 cgroup | `examples/doris/singlehost-cgroup2.env` | Doris/YCSB 同在 `kunpen183`，用 cpuset 分 NUMA node |
+| 双机 cgroup | `examples/doris/dualhost-cgroup2.env` | server/client 在各自主机按 cgroup 配置限制 |
+
+另有高级示例：
 
 ```bash
-./bin/yba run --config examples/singlehost-cgroup2.env
+./bin/yba run --config examples/doris/thread-cluster.env
 ```
 
-#### 双机模式
-
-`MODE=dualhost` 会在 `SERVER_HOST` 上执行服务端 hook，在 `CLIENT_HOST` 上运行 YCSB client。
-
-```bash
-./bin/yba run --config examples/dualhost-doris.env
-```
-
-#### 线程聚集
-
-线程聚集在服务端 ready 之后执行，通过线程名正则匹配 TID，再用 `taskset -pc` 绑定 CPU：
+该示例使用 `taskset -pc` 对 Doris BE 线程名做用户态线程聚集，不涉及内核调度器。规则格式：
 
 ```bash
 THREAD_CLUSTER_RULES='query:brpc_light|Pipe_normal|Scan_normal:32-63 background:brpc_heavy|Flush|Task:0-31'
 ```
 
-每条规则格式为：
+每条规则为 `name:comm_regex:cpu_list`。当前只绑定每轮开始时已经存在的 TID；Doris 后续动态创建的新线程需要重新绑定或后续扩展周期性 binder。
 
-```text
-name:comm_regex:cpu_list
-```
+## Doris Startup
 
-第一版只会对每轮开始时已经存在的 TID 执行一次绑定。如果程序后续动态创建新线程，需要重新执行绑定，或后续扩展为周期性 binder。
-
-### 核心配置
+Doris 默认通过自带脚本启停，不再依赖旧实验目录：
 
 ```bash
-MODE=singlehost|dualhost
-SERVER_HOST=kunpen183
-CLIENT_HOST=ubuntu197
-REMOTE_ROOT=/home/xhc/ExperScript/ycsb-bench-all-database
-LOCAL_RESULTS_ROOT=/data/sched-ext-study/ycsb-bench-all-database/experiments
-
-SSH_OPTS='-F ~/.ssh/config'
-SERVER_SSH_OPTS='-p 22183'
-CLIENT_SSH_OPTS='-p 22197'
-
-YCSB_HOME=/home/xhc/ycsb-jdbc-binding-0.17.0
-PYTHON2_BIN=python2
-JDBC_URL='jdbc:mysql://127.0.0.1:9030/ycsb?useSSL=false'
-JDBC_USER=root
-JDBC_PASSWORD=
-JDBC_DRIVER=com.mysql.cj.jdbc.Driver
-JDBC_JAR=/home/xhc/ycsb-jdbc-binding-0.17.0/lib/mysql-connector-java-8.0.28.jar
-TABLE=usertable
-
-WORKLOAD_FILE=
-GENERATE_WORKLOAD=1
-RECORDCOUNT=1000000
-OPERATIONCOUNT_PER_CLIENT=50000
-REQUEST_DISTRIBUTION=zipfian
-READ_PROPORTION=1
-UPDATE_PROPORTION=0
-MATRIX='t80:5:16 t128:8:16'
-ROUNDS=1
-
-ENABLE_CGROUP=0
-SERVER_CGROUP=/run/cgroup2/ycsb-bench/server
-CLIENT_CGROUP=/run/cgroup2/ycsb-bench/client
-SERVER_CPUSET_EXPECT=0-95
-SERVER_MEMS_EXPECT=0-2
-CLIENT_CPUSET_EXPECT=96-127
-CLIENT_MEMS_EXPECT=3
-
-ENABLE_THREAD_CLUSTER=0
-THREAD_CLUSTER_RULES='query:brpc_light|Pipe_normal|Scan_normal:32-63'
-
-SERVER_SETUP_CMD=
-SERVER_READY_CMD="mysql -h127.0.0.1 -P9030 -uroot -e 'select 1'"
-SERVER_CLEANUP_CMD=
-SERVER_PID_COMMAND='pgrep -x doris_be'
+DORIS_HOME=/home/xhc/doris/apache-doris-2.1.2-bin-arm64
+DORIS_START_FE=$DORIS_HOME/fe/bin/start_fe.sh
+DORIS_START_BE=$DORIS_HOME/be/bin/start_be.sh
+DORIS_STOP_FE=$DORIS_HOME/fe/bin/stop_fe.sh
+DORIS_STOP_BE=$DORIS_HOME/be/bin/stop_be.sh
+DORIS_READY_CMD="mysql -h127.0.0.1 -P9030 -uroot -e 'select 1'"
 ```
 
-`MATRIX` 的每个条目格式为：
+如果你的机器 Doris 安装路径不同，通常只需要改 `DORIS_HOME`。如需完全自定义启停流程，可以设置：
+
+```bash
+SERVER_SETUP_CMD='...'
+SERVER_READY_CMD='...'
+SERVER_CLEANUP_CMD='...'
+```
+
+显式 hook 会覆盖 Doris 默认启停逻辑。
+
+默认 Doris PID 发现同时包含 BE 和 FE：
+
+```bash
+SERVER_PID_COMMAND='pgrep -x doris_be; pgrep -f "org[.]apache[.]doris[.]DorisFE"'
+```
+
+## Swap Check
+
+Doris BE 启动时要求关闭 swap，否则可能报：
 
 ```text
-label:client_processes:threads_per_client
+Please disable swap memory before installation.
 ```
 
-例如 `t80:5:16` 表示启动 5 个 YCSB 进程，每个进程 16 个线程，总共 80 个 client 线程。
+yba 在 Doris preflight/start 前会检查 swap：
 
-### cgroup v2 要求
+```bash
+DORIS_SWAP_CHECK=1
+DORIS_SWAPOFF_WITH_SUDO=0
+```
 
-工具不会以 root 身份挂载 cgroup v2，也不会创建或授权 cgroup 子树。请提前准备好子树，然后配置：
+如果 swap 已开启且未允许 yba 使用 sudo，工具会失败并提示手动执行：
+
+```bash
+sudo swapoff -a
+```
+
+如果允许 yba 自动执行：
+
+```bash
+DORIS_SWAPOFF_WITH_SUDO=1
+SUDO_ASKPASS=/path/to/askpass.sh   # 可选
+```
+
+`swapoff -a` 只影响当前启动周期；yba 不会修改 `/etc/fstab`，因此重启后可能需要重新关闭 swap。
+
+## cgroup v2
+
+关闭 cgroup：
+
+```bash
+ENABLE_CGROUP=0
+```
+
+这会完全跳过 cgroup 检查、配置和进程迁移。
+
+启用 cgroup v2 cpuset：
 
 ```bash
 ENABLE_CGROUP=1
+CGROUP_ROOT=/run/cgroup2/doris-bench
 SERVER_CGROUP=/run/cgroup2/doris-bench/doris
 CLIENT_CGROUP=/run/cgroup2/doris-bench/ycsb
-SERVER_CPUSET_EXPECT=0-95
-SERVER_MEMS_EXPECT=0-2
-CLIENT_CPUSET_EXPECT=96-127
-CLIENT_MEMS_EXPECT=3
-```
-
-默认情况下，`preflight` 只检查 effective CPU 和 memory node 列表，不改 cgroup。如果当前用户已经拥有委托子树写权限，可以开启自动配置：
-
-```bash
-CGROUP_AUTO_CONFIG=1
-CGROUP_WRITE_WITH_SUDO=0
 SERVER_CPUSET_EXPECT=0-63
 SERVER_MEMS_EXPECT=0-1
 CLIENT_CPUSET_EXPECT=64-127
 CLIENT_MEMS_EXPECT=2-3
 ```
 
-上例表示 Doris 使用 node0-1，YCSB 使用 node2-3。开启后，`preflight` / `run` 会尝试写入 `cpuset.cpus` 和 `cpuset.mems`，再检查 effective 值。如果当前用户不能写，工具会报错并打印 root 侧创建、授权和 cpuset 配置建议。运行过程中，服务端 PID 和 YCSB client shell 会被迁移到对应 cgroup，并保存 `/proc/<pid>/status` 快照。
+如果 root 已经挂载并委托 `/run/cgroup2/doris-bench` 给当前用户，可以让 yba 写 `cpuset.cpus` 和 `cpuset.mems`：
 
-`CGROUP_WRITE_WITH_SUDO` 只控制 `cpuset.cpus` / `cpuset.mems` 写入。cgroup v2 的进程迁移写的是 `cgroup.procs`，可能需要单独的权限；如果 `preflight` 报 `cannot move pid ... cgroup.procs`，开启：
+```bash
+CGROUP_AUTO_CONFIG=1
+CGROUP_WRITE_WITH_SUDO=0
+```
+
+进程迁移写入的是 `cgroup.procs`，权限可能和 cpuset 文件不同：
+
+```bash
+CGROUP_PROCS_WRITE_WITH_SUDO=0
+```
+
+如果迁移时报 `cannot move pid ... cgroup.procs`，再单独改为：
 
 ```bash
 CGROUP_PROCS_WRITE_WITH_SUDO=1
-SUDO_ASKPASS=/path/to/askpass.sh
 ```
 
-如果 cpuset 配置本身也需要 sudo，再同时设置 `CGROUP_WRITE_WITH_SUDO=1`。
+单机模式会同时检查 server/client cgroup；双机模式会在 server 主机检查 server cgroup，在 client 主机检查 client cgroup。
 
-### SSH 与跳板机
+## ClickHouse
 
-默认情况下，工具直接使用配置中的 SSH alias：
+ClickHouse 本轮只提供模板：
+
+```text
+examples/clickhouse/singlehost-baseline.env.example
+examples/clickhouse/dualhost-baseline.env.example
+```
+
+使用前需要补齐：
 
 ```bash
-SERVER_HOST=kunpen183
-CLIENT_HOST=ubuntu197
+DB_TYPE=clickhouse
+JDBC_URL='jdbc:clickhouse://<host>:8123/ycsb'
+JDBC_DRIVER=com.clickhouse.jdbc.ClickHouseDriver
+JDBC_JAR=/path/to/clickhouse-jdbc.jar
+SERVER_SETUP_CMD='...'
+SERVER_READY_CMD='...'
+SERVER_CLEANUP_CMD='...'
+SERVER_PID_COMMAND='pgrep -x clickhouse-server'
 ```
 
-如果环境中存在跳板机、端口转发、独立 SSH config 或不同 key，可以显式配置：
+如果没有设置 ClickHouse 的启停 hook，preflight 会直接失败并提示补齐。
 
-```bash
-SSH_BIN=ssh
-SCP_BIN=scp
-RSYNC_BIN=rsync
-SSH_OPTS='-F /path/to/ssh_config -o BatchMode=yes'
-SERVER_SSH_OPTS='-J jump-host -i ~/.ssh/server_key'
-CLIENT_SSH_OPTS='-p 22197 -i ~/.ssh/client_key'
-```
-
-`SERVER_SSH_OPTS` 和 `CLIENT_SSH_OPTS` 会根据目标 host 是否等于 `SERVER_HOST` 或 `CLIENT_HOST` 自动追加到 `SSH_OPTS` 后面。`scp` 默认复用对应 SSH 参数；如需特殊配置，可使用 `SERVER_SCP_OPTS` 或 `CLIENT_SCP_OPTS`。
-
-`rsync` 默认通过同一套 SSH 命令作为 `-e` 参数。只有在需要自定义 remote shell 时才覆盖：
-
-```bash
-SERVER_RSYNC_RSH='ssh -F /path/to/ssh_config -J jump-host'
-CLIENT_RSYNC_RSH='ssh -F /path/to/ssh_config -p 22197'
-```
-
-### 输出
+## Output
 
 每次运行会在 `LOCAL_RESULTS_ROOT` 下创建带时间戳的实验目录：
 
@@ -213,30 +193,24 @@ experiments/<timestamp>-<experiment-name>/
       ps-top.log
     cgroup/
     thread-cluster/
-    doris/
+    server/
+  server/
   summary.csv
   summary-by-label.csv
   cpu-node-summary.csv
+  server-cpu-node-summary.csv
   report.md
 ```
 
 汇总规则：
 
-- throughput 对多个 client 日志求和。
-- average latency 按 READ operation count 加权平均。
-- P95/P99/P999 取多个 client 中的保守最大值。
-- error 和 timeout 从 YCSB 原始日志中解析。
-- NUMA node CPU busy 从 `/proc/stat` 采样，并按 `lscpu -e=CPU,NODE,ONLINE` 分组。
+- throughput：多个 YCSB client 日志求和。
+- average latency：按 READ operation count 加权平均。
+- P95/P99/P999：取多个 client 中的保守最大值。
+- error/timeout：从 YCSB 原始日志解析。
+- NUMA node CPU busy：读取 `/proc/stat` 并按 `lscpu -e=CPU,NODE,ONLINE` 聚合。
 
-### 安全说明
-
-- 脚本避免使用 `pkill -f`；清理应使用配置的 hook 或明确的进程名/PID。
-- 远端主机通过 SSH alias 访问，例如 `kunpen183` 和 `ubuntu197`。
-- 远端主机只作为执行环境；报告和关键 CSV 会同步回本地实验目录。
-- 线程名匹配依赖 Linux `comm`，通常会被截断到 15 个字符；建议使用前缀或较宽松的正则。
-- 单 NUMA node 聚集在中低负载可能提升局部性，但在高负载下可能变成瓶颈。
-
-### 本地验证
+## Verification
 
 ```bash
 bash -n bin/yba lib/*.sh
@@ -244,244 +218,10 @@ python3 -m py_compile tools/sample-node-cpu.py tools/summarize-ycsb.py
 python3 tests/test_summarize_ycsb.py
 ```
 
-## English
+## Operational Notes
 
-`ycsb-bench-all-database` is a Bash CLI for repeatable JDBC/YCSB database benchmarks. It packages the Doris/YCSB workflows used in this repository: single-host runs, dual-host runs, cgroup v2 cpuset isolation, user-space thread clustering, multi-client YCSB pressure, node CPU sampling, raw log collection, and CSV/Markdown summaries.
-
-The first version is intentionally dependency-light:
-
-- Configuration is a shell env file.
-- The database interface is generic JDBC.
-- Doris support is provided through example configs and `SERVER_SETUP_CMD` / `SERVER_CLEANUP_CMD` hooks.
-- cgroup v2 setup is checked and used, but root-level mounting and delegation are left to the operator.
-
-### Layout
-
-```text
-ycsb-bench-all-database/
-  bin/yba
-  lib/
-  tools/
-  examples/
-  experiments/
-```
-
-### CLI
-
-```bash
-./bin/yba preflight --config examples/singlehost-cgroup2.env
-./bin/yba run --config examples/singlehost-cgroup2.env
-./bin/yba summarize --experiment-dir experiments/<run>
-./bin/yba cleanup --config examples/singlehost-cgroup2.env
-```
-
-Environment variables override config-file values:
-
-```bash
-MATRIX="t1:1:1" OPERATIONCOUNT_PER_CLIENT=1000 \
-  ./bin/yba run --config examples/dualhost-doris.env
-```
-
-### Modes
-
-#### Single Host
-
-`MODE=singlehost` runs the server hook and YCSB clients on `SERVER_HOST`. This is useful when you isolate resources with cgroup v2, for example Doris on NUMA nodes 0-2 and YCSB on node3.
-
-```bash
-./bin/yba run --config examples/singlehost-cgroup2.env
-```
-
-#### Dual Host
-
-`MODE=dualhost` runs server hooks on `SERVER_HOST` and YCSB clients on `CLIENT_HOST`.
-
-```bash
-./bin/yba run --config examples/dualhost-doris.env
-```
-
-#### Thread Clustering
-
-Thread clustering uses thread-name regex rules plus `taskset -pc` after the server is ready:
-
-```bash
-THREAD_CLUSTER_RULES='query:brpc_light|Pipe_normal|Scan_normal:32-63 background:brpc_heavy|Flush|Task:0-31'
-```
-
-Each rule is:
-
-```text
-name:comm_regex:cpu_list
-```
-
-The first version applies rules to existing TIDs once per run. If a program creates matching threads later, rerun clustering or extend the tool with a periodic binder.
-
-### Core Configuration
-
-```bash
-MODE=singlehost|dualhost
-SERVER_HOST=kunpen183
-CLIENT_HOST=ubuntu197
-REMOTE_ROOT=/home/xhc/ExperScript/ycsb-bench-all-database
-LOCAL_RESULTS_ROOT=/data/sched-ext-study/ycsb-bench-all-database/experiments
-
-SSH_OPTS='-F ~/.ssh/config'
-SERVER_SSH_OPTS='-p 22183'
-CLIENT_SSH_OPTS='-p 22197'
-
-YCSB_HOME=/home/xhc/ycsb-jdbc-binding-0.17.0
-PYTHON2_BIN=python2
-JDBC_URL='jdbc:mysql://127.0.0.1:9030/ycsb?useSSL=false'
-JDBC_USER=root
-JDBC_PASSWORD=
-JDBC_DRIVER=com.mysql.cj.jdbc.Driver
-JDBC_JAR=/home/xhc/ycsb-jdbc-binding-0.17.0/lib/mysql-connector-java-8.0.28.jar
-TABLE=usertable
-
-WORKLOAD_FILE=
-GENERATE_WORKLOAD=1
-RECORDCOUNT=1000000
-OPERATIONCOUNT_PER_CLIENT=50000
-REQUEST_DISTRIBUTION=zipfian
-READ_PROPORTION=1
-UPDATE_PROPORTION=0
-MATRIX='t80:5:16 t128:8:16'
-ROUNDS=1
-
-ENABLE_CGROUP=0
-SERVER_CGROUP=/run/cgroup2/ycsb-bench/server
-CLIENT_CGROUP=/run/cgroup2/ycsb-bench/client
-SERVER_CPUSET_EXPECT=0-95
-SERVER_MEMS_EXPECT=0-2
-CLIENT_CPUSET_EXPECT=96-127
-CLIENT_MEMS_EXPECT=3
-
-ENABLE_THREAD_CLUSTER=0
-THREAD_CLUSTER_RULES='query:brpc_light|Pipe_normal|Scan_normal:32-63'
-
-SERVER_SETUP_CMD=
-SERVER_READY_CMD="mysql -h127.0.0.1 -P9030 -uroot -e 'select 1'"
-SERVER_CLEANUP_CMD=
-SERVER_PID_COMMAND='pgrep -x doris_be'
-```
-
-`MATRIX` entries use:
-
-```text
-label:client_processes:threads_per_client
-```
-
-For example `t80:5:16` means 5 YCSB processes, 16 threads per process, 80 total client threads.
-
-### cgroup v2 Requirements
-
-The tool does not mount cgroup v2 or create delegated subtrees as root. Prepare them beforehand, then configure:
-
-```bash
-ENABLE_CGROUP=1
-SERVER_CGROUP=/run/cgroup2/doris-bench/doris
-CLIENT_CGROUP=/run/cgroup2/doris-bench/ycsb
-SERVER_CPUSET_EXPECT=0-95
-SERVER_MEMS_EXPECT=0-2
-CLIENT_CPUSET_EXPECT=96-127
-CLIENT_MEMS_EXPECT=3
-```
-
-By default, `preflight` only checks effective CPU and memory node lists. If the current user owns the delegated cgroup subtree, enable automatic cpuset configuration:
-
-```bash
-CGROUP_AUTO_CONFIG=1
-CGROUP_WRITE_WITH_SUDO=0
-SERVER_CPUSET_EXPECT=0-63
-SERVER_MEMS_EXPECT=0-1
-CLIENT_CPUSET_EXPECT=64-127
-CLIENT_MEMS_EXPECT=2-3
-```
-
-This example places Doris on node0-1 and YCSB on node2-3. With auto config enabled, `preflight` / `run` writes `cpuset.cpus` and `cpuset.mems`, then verifies effective values. If the current user cannot write the subtree, the tool fails with recommended root-side setup and delegation commands. During a run, server PIDs and YCSB client shells are moved into their configured cgroups and `/proc/<pid>/status` snapshots are saved.
-
-`CGROUP_WRITE_WITH_SUDO` only controls `cpuset.cpus` / `cpuset.mems` writes. cgroup v2 process migration writes `cgroup.procs` and may require separate permission. If `preflight` reports `cannot move pid ... cgroup.procs`, enable:
-
-```bash
-CGROUP_PROCS_WRITE_WITH_SUDO=1
-SUDO_ASKPASS=/path/to/askpass.sh
-```
-
-If cpuset configuration also requires sudo, set `CGROUP_WRITE_WITH_SUDO=1` as well.
-
-### SSH and Jump Hosts
-
-The tool uses the configured SSH alias by default:
-
-```bash
-SERVER_HOST=kunpen183
-CLIENT_HOST=ubuntu197
-```
-
-For non-standard SSH setups, configure the transport explicitly:
-
-```bash
-SSH_BIN=ssh
-SCP_BIN=scp
-RSYNC_BIN=rsync
-SSH_OPTS='-F /path/to/ssh_config -o BatchMode=yes'
-SERVER_SSH_OPTS='-J jump-host -i ~/.ssh/server_key'
-CLIENT_SSH_OPTS='-p 22197 -i ~/.ssh/client_key'
-```
-
-`SERVER_SSH_OPTS` and `CLIENT_SSH_OPTS` are appended to `SSH_OPTS` based on whether the target host equals `SERVER_HOST` or `CLIENT_HOST`. `scp` reuses the matching SSH options by default; override with `SERVER_SCP_OPTS` or `CLIENT_SCP_OPTS` if needed.
-
-`rsync` uses the same SSH command through `-e`. Override only when your environment needs a custom remote shell:
-
-```bash
-SERVER_RSYNC_RSH='ssh -F /path/to/ssh_config -J jump-host'
-CLIENT_RSYNC_RSH='ssh -F /path/to/ssh_config -p 22197'
-```
-
-### Output
-
-Each run creates a timestamped experiment directory under `LOCAL_RESULTS_ROOT`:
-
-```text
-experiments/<timestamp>-<experiment-name>/
-  <label>/r1/
-    meta/
-    metrics/
-      ycsb-raw/client-*.log
-      cpu-node-samples.csv
-      vmstat.log
-      numastat-before.txt
-      numastat-after.txt
-      ps-top.log
-    cgroup/
-    thread-cluster/
-    doris/
-  summary.csv
-  summary-by-label.csv
-  cpu-node-summary.csv
-  report.md
-```
-
-Aggregation rules:
-
-- Throughput is summed across client logs.
-- Average latency is weighted by READ operation count.
-- P95/P99/P999 use the conservative max across client logs.
-- Errors and timeouts are counted from raw YCSB logs.
-- CPU node busy is sampled from `/proc/stat` and grouped by `lscpu -e=CPU,NODE,ONLINE`.
-
-### Safety Notes
-
-- The scripts avoid `pkill -f`; cleanup should use configured hooks or tracked process names.
-- Remote hosts are addressed through SSH aliases such as `kunpen183` and `ubuntu197`.
-- Remote hosts are execution environments. Reports and key CSV files are synchronized back to the local experiment directory.
-- Thread-name matching depends on Linux `comm`, which is commonly truncated to 15 characters. Use prefixes or broad regexes when needed.
-- Single-node clustering can improve medium/low-load locality but can become a bottleneck under higher load.
-
-### Local Verification
-
-```bash
-bash -n bin/yba lib/*.sh
-python3 -m py_compile tools/sample-node-cpu.py tools/summarize-ycsb.py
-python3 tests/test_summarize_ycsb.py
-```
+- `kunpen183` / `ubuntu197` 默认通过 SSH alias 访问；正式服务器可改成 IP。
+- 远端机器只作为执行环境，关键 CSV 和报告会同步回本地 `experiments/`。
+- 清理逻辑依赖配置 hook 和明确 PID，避免使用 `pkill -f`。
+- 用户态线程聚集依赖 Linux `comm`，线程名可能被截断到 15 字符。
+- 单 NUMA node 聚集在中低负载可能有效，高负载下可能变成 CPU 争用瓶颈。
