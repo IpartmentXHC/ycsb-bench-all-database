@@ -49,6 +49,68 @@ THREAD_CLUSTER_RULES='query:brpc_light|Pipe_normal|Scan_normal:32-63 background:
 
 每条规则为 `name:comm_regex:cpu_list`。当前只绑定每轮开始时已经存在的 TID；Doris 后续动态创建的新线程需要重新绑定或后续扩展周期性 binder。
 
+## Doris Thread-Cluster Suite
+
+如果要复跑当前 Doris 双机线程聚集实验，使用 suite runner：
+
+```bash
+cd /data/sched-ext-study/ycsb-bench-all-database
+
+CONFIG=examples/doris/dualhost-baseline.env \
+SUITE_NAME=20260623-doris-dualhost-thread-cluster-node3-node2-x3-rerun \
+OPS_PER_CLIENT=50000 \
+RUN_SECONDS=1800 \
+tools/run-doris-thread-cluster-suite.sh
+```
+
+默认 suite 包含：
+
+- `baseline`
+- `numa_node1`
+- `cluster_hot_node3_other_node2`
+- `t16:t16:1:16`
+- `t80:t80:5:16`
+- `3` 轮
+
+新机器建议从模板开始：
+
+```bash
+cp examples/doris/dualhost-thread-cluster-suite.env.example \
+   examples/doris/dualhost-thread-cluster-suite.env
+
+# 编辑 SERVER_HOST / CLIENT_HOST / JDBC_URL / DORIS_HOME / YCSB_HOME / JDBC_JAR
+vim examples/doris/dualhost-thread-cluster-suite.env
+
+set -a
+source examples/doris/dualhost-thread-cluster-suite.env
+set +a
+
+tools/run-doris-thread-cluster-suite.sh --print-config
+./bin/yba preflight --config "$CONFIG"
+tools/run-doris-thread-cluster-suite.sh
+```
+
+suite runner 已参数化以下关键项：
+
+```bash
+NUMA_CONTROL_NODE=1
+NUMA_CONTROL_CPUS=32-63
+OTHER_NODE_CPUS=64-95
+HOT_NODE_CPUS=96-127
+HOT_THREAD_REGEX='brpc_heavy|brpc_light|Pipe_normal'
+SUITE_LOADS='t16:t16:1:16 t80:t80:5:16'
+SUITE_PROFILES='baseline numa_node1 cluster_hot_node3_other_node2'
+SUITE_ROUNDS=3
+```
+
+如果新机器仍是 4 个 NUMA node、每个 node 32 CPU，通常只需要改 host、JDBC 地址和 Doris/YCSB 路径。如果 CPU 拓扑不同，先用：
+
+```bash
+ssh <doris-server-host> 'lscpu -e=CPU,NODE,SOCKET,CORE,ONLINE; numactl --hardware'
+```
+
+再调整 `NUMA_CONTROL_CPUS`、`OTHER_NODE_CPUS`、`HOT_NODE_CPUS` 和 `NUMA_CONTROL_NODE`。
+
 ## Doris Startup
 
 Doris 默认通过自带脚本启停，不再依赖旧实验目录：

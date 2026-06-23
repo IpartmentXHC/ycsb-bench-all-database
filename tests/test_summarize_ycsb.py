@@ -948,7 +948,22 @@ yba_remote_env_prefix
                 (tc / "summary.csv").write_text(tc_summary, encoding="utf-8")
 
             result = subprocess.run(
-                ["python3", str(ROOT / "tools" / "summarize-suite.py"), "--suite-dir", str(suite)],
+                [
+                    "python3",
+                    str(ROOT / "tools" / "summarize-suite.py"),
+                    "--suite-dir",
+                    str(suite),
+                    "--server-host",
+                    "db-host",
+                    "--client-host",
+                    "ycsb-host",
+                    "--hot-node-cpus",
+                    "96-127",
+                    "--other-node-cpus",
+                    "64-95",
+                    "--numa-control-cpus",
+                    "32-63",
+                ],
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -966,8 +981,48 @@ yba_remote_env_prefix
             self.assertIn("cluster_hot_node3_other_node2,t16,r1,hot,2,2,2,0,0,1.000000,stable", tc_text)
             report = (suite / "ycsb-doris-dualhost-thread-cluster-node3-node2-x3-report-cn.md").read_text(encoding="utf-8")
             self.assertIn("## 关键结论", report)
+            self.assertIn("服务端：`db-host` Doris；客户端：`ycsb-host` YCSB。", report)
             self.assertIn("cluster_hot_node3_other_node2 在 t16 下相对 baseline 吞吐 +23.81%", report)
             self.assertIn("相对 numa_node1 +8.33%", report)
+            self.assertIn("目标线程稳定落在 hot CPU 集合 `96-127`", report)
+            self.assertIn("other CPU 集合 `64-95`", report)
+
+    def test_thread_cluster_suite_runner_prints_overridden_config(self):
+        script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r} \\
+CONFIG=/tmp/custom.env \\
+SUITE_NAME=custom-suite \\
+SUITE_LOADS='small:t2:1:2' \\
+SUITE_ROUNDS=2 \\
+SUITE_PROFILES='baseline cluster_hot_node3_other_node2' \\
+DORIS_HOME=/opt/doris \\
+NUMA_CONTROL_NODE=2 \\
+NUMA_CONTROL_CPUS=64-95 \\
+HOT_THREAD_REGEX='brpc_light|Pipe_normal' \\
+HOT_NODE_CPUS=96-127 \\
+OTHER_NODE_CPUS=32-63 \\
+SERVER_HOST=db-host \\
+CLIENT_HOST=ycsb-host \\
+JDBC_URL='jdbc:mysql://10.0.0.1:9030/ycsb' \\
+{str(ROOT / "tools" / "run-doris-thread-cluster-suite.sh")} --print-config
+"""
+        result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("CONFIG=/tmp/custom.env", result.stdout)
+        self.assertIn("SUITE_NAME=custom-suite", result.stdout)
+        self.assertIn("SUITE_LOADS=small:t2:1:2", result.stdout)
+        self.assertIn("SUITE_ROUNDS=2", result.stdout)
+        self.assertIn("SUITE_PROFILES=baseline cluster_hot_node3_other_node2", result.stdout)
+        self.assertIn("DORIS_HOME=/opt/doris", result.stdout)
+        self.assertIn("NUMA_CONTROL_NODE=2", result.stdout)
+        self.assertIn("NUMA_CONTROL_CPUS=64-95", result.stdout)
+        self.assertIn("HOT_THREAD_REGEX=brpc_light|Pipe_normal", result.stdout)
+        self.assertIn("HOT_NODE_CPUS=96-127", result.stdout)
+        self.assertIn("OTHER_NODE_CPUS=32-63", result.stdout)
+        self.assertIn("SERVER_HOST=db-host", result.stdout)
+        self.assertIn("CLIENT_HOST=ycsb-host", result.stdout)
+        self.assertIn("JDBC_URL=jdbc:mysql://10.0.0.1:9030/ycsb", result.stdout)
 
 
 if __name__ == "__main__":

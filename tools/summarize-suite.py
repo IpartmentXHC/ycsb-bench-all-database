@@ -148,7 +148,7 @@ def md_table(rows, fields):
     return "\n".join(lines)
 
 
-def build_key_findings(agg_rows, thread_rows):
+def build_key_findings(agg_rows, thread_rows, hot_node_cpus, other_node_cpus):
     lines = ["## 关键结论", ""]
     by_profile_load = {(row.get("profile"), row.get("load")): row for row in agg_rows}
     loads = sorted({row.get("load") for row in agg_rows if row.get("load")})
@@ -187,7 +187,8 @@ def build_key_findings(agg_rows, thread_rows):
         min_hot = min(fnum(row.get("hit_ratio")) for row in hot_rows)
         lines.append(
             "- 线程聚集证据：cluster profile 的 hot 规则在所有轮次 hit_ratio 最低为 "
-            f"{min_hot:.6f}，说明 brpc_heavy/brpc_light/Pipe_normal 目标线程稳定落在 node3。"
+            f"{min_hot:.6f}，说明 brpc_heavy/brpc_light/Pipe_normal 目标线程稳定落在 hot CPU 集合 "
+            f"`{hot_node_cpus}`。"
         )
     other_rows = [
         row
@@ -200,7 +201,7 @@ def build_key_findings(agg_rows, thread_rows):
         lines.append(
             "- other 规则是一次性 taskset 尽力放置，hit_ratio 范围为 "
             f"{min_other:.6f}-{max_other:.6f}，因此本轮结论主要建立在 hot 线程组稳定聚集上，"
-            "不能把 other 组视为严格隔离成功。"
+            f"不能把 other CPU 集合 `{other_node_cpus}` 视为严格隔离成功。"
         )
     numa_rows = [row for row in thread_rows if row.get("profile") == "numa_node1" and row.get("rule") == "all"]
     if numa_rows:
@@ -218,7 +219,7 @@ def build_key_findings(agg_rows, thread_rows):
     return lines
 
 
-def build_report(suite_dir, rows, agg_rows, thread_rows):
+def build_report(suite_dir, rows, agg_rows, thread_rows, server_host, client_host, hot_node_cpus, other_node_cpus, numa_control_cpus):
     report = [
         "# Doris/YCSB 双机线程聚集 Node3/Node2 复验报告",
         "",
@@ -226,12 +227,13 @@ def build_report(suite_dir, rows, agg_rows, thread_rows):
         "",
         f"- Suite directory: `{suite_dir}`",
         f"- Runs discovered: `{len(rows)}`",
-        "- 服务端：`kunpen183` Doris；客户端：`ubuntu197` YCSB。",
+        f"- 服务端：`{server_host}` Doris；客户端：`{client_host}` YCSB。",
         "- Profile：baseline、numa_node1、cluster_hot_node3_other_node2。",
         "- Load：t16 与 t80；每个 profile/load 3 轮。",
+        f"- CPU 配置：numa control `{numa_control_cpus}`；hot `{hot_node_cpus}`；other `{other_node_cpus}`。",
         "",
     ]
-    report.extend(build_key_findings(agg_rows, thread_rows))
+    report.extend(build_key_findings(agg_rows, thread_rows, hot_node_cpus, other_node_cpus))
     report.extend(
         [
         "## 每轮结果",
@@ -260,6 +262,11 @@ def build_report(suite_dir, rows, agg_rows, thread_rows):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--suite-dir", required=True)
+    parser.add_argument("--server-host", default="kunpen183")
+    parser.add_argument("--client-host", default="ubuntu197")
+    parser.add_argument("--hot-node-cpus", default="96-127")
+    parser.add_argument("--other-node-cpus", default="64-95")
+    parser.add_argument("--numa-control-cpus", default="32-63")
     args = parser.parse_args()
     suite_dir = Path(args.suite_dir).resolve()
 
@@ -283,7 +290,17 @@ def main():
         ["profile", "load", "round", "rule", "bound_threads", "after_ycsb_threads", "on_target_cpu_threads", "new_threads", "missing_threads", "hit_ratio", "thread_set_state"],
     )
     (suite_dir / "ycsb-doris-dualhost-thread-cluster-node3-node2-x3-report-cn.md").write_text(
-        build_report(suite_dir, rows, agg_rows, thread_rows),
+        build_report(
+            suite_dir,
+            rows,
+            agg_rows,
+            thread_rows,
+            args.server_host,
+            args.client_host,
+            args.hot_node_cpus,
+            args.other_node_cpus,
+            args.numa_control_cpus,
+        ),
         encoding="utf-8",
     )
 
