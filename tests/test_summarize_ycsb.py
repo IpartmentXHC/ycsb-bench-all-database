@@ -484,6 +484,491 @@ test -d {str(run_dir / "server")!r}
             result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_thread_cluster_static_check_records_bound_and_stable_threads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fakebin = Path(tmp) / "bin"
+            fakebin.mkdir()
+            taskset_log = Path(tmp) / "taskset.log"
+            ps_script = fakebin / "ps"
+            ps_script.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "-T" ]; then
+  if printf '%s\n' "$*" | grep -q 'psr'; then
+    echo "101 brpc_light 32"
+    echo "102 Pipe_normal 33"
+    echo "103 Scan_normal 34"
+    echo "104 brpc_heavy 2"
+    exit 0
+  fi
+  echo "101 brpc_light"
+  echo "102 Pipe_normal"
+  echo "103 Scan_normal"
+  echo "104 brpc_heavy"
+  exit 0
+fi
+if [ "$1" = "-o" ]; then
+  cat <<'EOF'
+  101   501    32  0.0 brpc_light
+  102   501    33  0.0 Pipe_normal
+  103   501    34  0.0 Scan_normal
+  104   501     2  0.0 brpc_heavy
+EOF
+  exit 0
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            ps_script.chmod(0o755)
+            taskset_script = fakebin / "taskset"
+            taskset_script.write_text(
+                f"#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> {str(taskset_log)!r}\n",
+                encoding="utf-8",
+            )
+            taskset_script.chmod(0o755)
+            run_dir = Path(tmp) / "run"
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/cgroup.sh"
+PATH={str(fakebin)!r}:$PATH
+SERVER_PID_COMMAND='printf "501\\n"'
+ENABLE_THREAD_CLUSTER=1
+THREAD_CLUSTER_RULES='query:brpc_light|Pipe_normal|Scan_normal:32-63 background:brpc_heavy:0-31'
+THREAD_CLUSTER_STRICT=1
+THREAD_CLUSTER_MIN_HIT_RATIO=1.0
+yba_apply_defaults
+yba_apply_thread_cluster {str(run_dir)!r}
+yba_check_thread_cluster_static {str(run_dir)!r}
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            actions = (run_dir / "thread-cluster" / "actions.csv").read_text(encoding="utf-8")
+            self.assertIn("query,501,101,brpc_light,32-63,bound", actions)
+            self.assertIn("background,501,104,brpc_heavy,0-31,bound", actions)
+            summary = (run_dir / "thread-cluster" / "summary.csv").read_text(encoding="utf-8")
+            self.assertIn("query,3,3,3,0,0,1.000000,stable", summary)
+            self.assertIn("background,1,1,1,0,0,1.000000,stable", summary)
+
+    def test_thread_cluster_strict_mode_fails_when_thread_runs_outside_target_cpus(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fakebin = Path(tmp) / "bin"
+            fakebin.mkdir()
+            ps_script = fakebin / "ps"
+            ps_script.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "-T" ]; then
+  if printf '%s\n' "$*" | grep -q 'psr'; then
+    echo "101 brpc_light 2"
+    exit 0
+  fi
+  echo "101 brpc_light"
+  exit 0
+fi
+if [ "$1" = "-o" ]; then
+  echo "  101   501     2  0.0 brpc_light"
+  exit 0
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            ps_script.chmod(0o755)
+            taskset_script = fakebin / "taskset"
+            taskset_script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            taskset_script.chmod(0o755)
+            run_dir = Path(tmp) / "run"
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/cgroup.sh"
+PATH={str(fakebin)!r}:$PATH
+SERVER_PID_COMMAND='printf "501\\n"'
+ENABLE_THREAD_CLUSTER=1
+THREAD_CLUSTER_RULES='query:brpc_light:32-63'
+THREAD_CLUSTER_STRICT=1
+THREAD_CLUSTER_MIN_HIT_RATIO=1.0
+yba_apply_defaults
+yba_apply_thread_cluster {str(run_dir)!r}
+yba_check_thread_cluster_static {str(run_dir)!r}
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("thread cluster verification failed", result.stderr)
+
+    def test_thread_cluster_can_ignore_thread_set_changes_when_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fakebin = Path(tmp) / "bin"
+            fakebin.mkdir()
+            psr_state = Path(tmp) / "psr-state"
+            ps_script = fakebin / "ps"
+            ps_script.write_text(
+                f"""#!/usr/bin/env bash
+if [ "$1" = "-T" ]; then
+  if printf '%s\\n' "$*" | grep -q 'psr'; then
+    count=0
+    if [ -f {str(psr_state)!r} ]; then
+      count=$(cat {str(psr_state)!r})
+    fi
+    count=$((count + 1))
+    echo "$count" > {str(psr_state)!r}
+    echo "101 brpc_light 32"
+    if [ "$count" -le 2 ]; then
+      echo "102 brpc_light 33"
+    fi
+    exit 0
+  fi
+  echo "101 brpc_light"
+  echo "102 brpc_light"
+  exit 0
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            ps_script.chmod(0o755)
+            taskset_script = fakebin / "taskset"
+            taskset_script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            taskset_script.chmod(0o755)
+            run_dir = Path(tmp) / "run"
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/cgroup.sh"
+PATH={str(fakebin)!r}:$PATH
+SERVER_PID_COMMAND='printf "501\\n"'
+ENABLE_THREAD_CLUSTER=1
+THREAD_CLUSTER_RULES='query:brpc_light:32-63'
+THREAD_CLUSTER_STRICT=1
+THREAD_CLUSTER_REQUIRE_STABLE=0
+THREAD_CLUSTER_MIN_HIT_RATIO=1.0
+yba_apply_defaults
+yba_apply_thread_cluster {str(run_dir)!r}
+yba_check_thread_cluster_static {str(run_dir)!r}
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            summary = (run_dir / "thread-cluster" / "summary.csv").read_text(encoding="utf-8")
+            self.assertIn("query,2,1,1,0,1,1.000000,changed", summary)
+
+    def test_thread_cluster_strict_rules_can_ignore_default_group_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fakebin = Path(tmp) / "bin"
+            fakebin.mkdir()
+            ps_script = fakebin / "ps"
+            ps_script.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "-T" ]; then
+  if printf '%s\n' "$*" | grep -q 'psr'; then
+    echo "101 brpc_light 96"
+    echo "102 other_worker 2"
+    exit 0
+  fi
+  echo "101 brpc_light"
+  echo "102 other_worker"
+  exit 0
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            ps_script.chmod(0o755)
+            taskset_script = fakebin / "taskset"
+            taskset_script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            taskset_script.chmod(0o755)
+            run_dir = Path(tmp) / "run"
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/cgroup.sh"
+PATH={str(fakebin)!r}:$PATH
+SERVER_PID_COMMAND='printf "501\\n"'
+ENABLE_THREAD_CLUSTER=1
+THREAD_CLUSTER_RULES='hot:brpc_light:96-127'
+THREAD_CLUSTER_DEFAULT_NAME=other
+THREAD_CLUSTER_DEFAULT_CPUS=64-95
+THREAD_CLUSTER_STRICT=1
+THREAD_CLUSTER_STRICT_RULES=hot
+THREAD_CLUSTER_MIN_HIT_RATIO=1.0
+yba_apply_defaults
+yba_apply_thread_cluster {str(run_dir)!r}
+yba_check_thread_cluster_static {str(run_dir)!r}
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            summary = (run_dir / "thread-cluster" / "summary.csv").read_text(encoding="utf-8")
+            self.assertIn("hot,1,1,1,0,0,1.000000,stable", summary)
+            self.assertIn("other,1,1,0,0,0,0.000000,stable", summary)
+
+    def test_thread_cluster_strict_mode_fails_when_binding_command_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fakebin = Path(tmp) / "bin"
+            fakebin.mkdir()
+            ps_script = fakebin / "ps"
+            ps_script.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "-T" ]; then
+  if printf '%s\n' "$*" | grep -q 'psr'; then
+    echo "101 brpc_light 32"
+    exit 0
+  fi
+  echo "101 brpc_light"
+  exit 0
+fi
+if [ "$1" = "-o" ]; then
+  echo "  101   501    32  0.0 brpc_light"
+  exit 0
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            ps_script.chmod(0o755)
+            taskset_script = fakebin / "taskset"
+            taskset_script.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+            taskset_script.chmod(0o755)
+            run_dir = Path(tmp) / "run"
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/cgroup.sh"
+PATH={str(fakebin)!r}:$PATH
+SERVER_PID_COMMAND='printf "501\\n"'
+ENABLE_THREAD_CLUSTER=1
+THREAD_CLUSTER_RULES='query:brpc_light:32-63'
+THREAD_CLUSTER_STRICT=1
+THREAD_CLUSTER_MIN_HIT_RATIO=1.0
+yba_apply_defaults
+yba_apply_thread_cluster {str(run_dir)!r}
+yba_check_thread_cluster_static {str(run_dir)!r}
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("thread cluster verification failed", result.stderr)
+            actions = (run_dir / "thread-cluster" / "actions.csv").read_text(encoding="utf-8")
+            self.assertIn("query,501,101,brpc_light,32-63,failed", actions)
+
+    def test_thread_cluster_default_cpus_bind_only_unmatched_threads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fakebin = Path(tmp) / "bin"
+            fakebin.mkdir()
+            ps_script = fakebin / "ps"
+            ps_script.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "-T" ]; then
+  if printf '%s\n' "$*" | grep -q 'psr'; then
+    echo "101 brpc_light 96"
+    echo "102 Pipe_normal 97"
+    echo "103 other_worker 64"
+    exit 0
+  fi
+  echo "101 brpc_light"
+  echo "102 Pipe_normal"
+  echo "103 other_worker"
+  exit 0
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            ps_script.chmod(0o755)
+            taskset_script = fakebin / "taskset"
+            taskset_script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            taskset_script.chmod(0o755)
+            run_dir = Path(tmp) / "run"
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/cgroup.sh"
+PATH={str(fakebin)!r}:$PATH
+SERVER_PID_COMMAND='printf "501\\n"'
+ENABLE_THREAD_CLUSTER=1
+THREAD_CLUSTER_RULES='hot:brpc_light|Pipe_normal:96-127'
+THREAD_CLUSTER_DEFAULT_NAME=other
+THREAD_CLUSTER_DEFAULT_CPUS=64-95
+THREAD_CLUSTER_STRICT=1
+THREAD_CLUSTER_MIN_HIT_RATIO=1.0
+yba_apply_defaults
+yba_apply_thread_cluster {str(run_dir)!r}
+yba_check_thread_cluster_static {str(run_dir)!r}
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            actions = (run_dir / "thread-cluster" / "actions.csv").read_text(encoding="utf-8")
+            self.assertIn("hot,501,101,brpc_light,96-127,bound", actions)
+            self.assertIn("hot,501,102,Pipe_normal,96-127,bound", actions)
+            self.assertIn("other,501,103,other_worker,64-95,bound", actions)
+            self.assertNotIn("other,501,101,brpc_light,64-95,bound", actions)
+            summary = (run_dir / "thread-cluster" / "summary.csv").read_text(encoding="utf-8")
+            self.assertIn("hot,2,2,2,0,0,1.000000,stable", summary)
+            self.assertIn("other,1,1,1,0,0,1.000000,stable", summary)
+
+    def test_thread_cluster_static_check_parses_ps_output_with_leading_spaces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fakebin = Path(tmp) / "bin"
+            fakebin.mkdir()
+            ps_script = fakebin / "ps"
+            ps_script.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "-T" ]; then
+  if printf '%s\n' "$*" | grep -q 'psr'; then
+    echo " 101 brpc_light         96"
+    echo " 102 other_worker       64"
+    exit 0
+  fi
+  echo "101 brpc_light"
+  echo "102 other_worker"
+  exit 0
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            ps_script.chmod(0o755)
+            taskset_script = fakebin / "taskset"
+            taskset_script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            taskset_script.chmod(0o755)
+            run_dir = Path(tmp) / "run"
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/cgroup.sh"
+PATH={str(fakebin)!r}:$PATH
+SERVER_PID_COMMAND='printf "501\\n"'
+ENABLE_THREAD_CLUSTER=1
+THREAD_CLUSTER_RULES='hot:brpc_light:96-127'
+THREAD_CLUSTER_DEFAULT_NAME=other
+THREAD_CLUSTER_DEFAULT_CPUS=64-95
+THREAD_CLUSTER_STRICT=1
+THREAD_CLUSTER_MIN_HIT_RATIO=1.0
+yba_apply_defaults
+yba_apply_thread_cluster {str(run_dir)!r}
+yba_check_thread_cluster_static {str(run_dir)!r}
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            after_bind = (run_dir / "thread-cluster" / "after-bind-matches.csv").read_text(encoding="utf-8")
+            self.assertIn("after-bind,hot,501,101,brpc_light,96-127,96,1", after_bind)
+            self.assertIn("after-bind,other,501,102,other_worker,64-95,64,1", after_bind)
+
+    def test_thread_cluster_static_check_parses_comm_with_spaces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fakebin = Path(tmp) / "bin"
+            fakebin.mkdir()
+            ps_script = fakebin / "ps"
+            ps_script.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "-T" ]; then
+  if printf '%s\n' "$*" | grep -q 'psr'; then
+    echo " 101 Gang worker#0         64"
+    exit 0
+  fi
+  echo "101 Gang worker#0"
+  exit 0
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            ps_script.chmod(0o755)
+            taskset_script = fakebin / "taskset"
+            taskset_script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            taskset_script.chmod(0o755)
+            run_dir = Path(tmp) / "run"
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/cgroup.sh"
+PATH={str(fakebin)!r}:$PATH
+SERVER_PID_COMMAND='printf "501\\n"'
+ENABLE_THREAD_CLUSTER=1
+THREAD_CLUSTER_RULES=
+THREAD_CLUSTER_DEFAULT_NAME=other
+THREAD_CLUSTER_DEFAULT_CPUS=64-95
+THREAD_CLUSTER_STRICT=1
+THREAD_CLUSTER_MIN_HIT_RATIO=1.0
+yba_apply_defaults
+yba_apply_thread_cluster {str(run_dir)!r}
+yba_check_thread_cluster_static {str(run_dir)!r}
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            after_bind = (run_dir / "thread-cluster" / "after-bind-matches.csv").read_text(encoding="utf-8")
+            self.assertIn("after-bind,other,501,101,Gang worker#0,64-95,64,1", after_bind)
+
+    def test_remote_env_prefix_exports_thread_cluster_default_settings(self):
+        script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/ssh.sh"
+ENABLE_THREAD_CLUSTER=1
+THREAD_CLUSTER_DEFAULT_NAME=other
+THREAD_CLUSTER_DEFAULT_CPUS=64-95
+yba_apply_defaults
+yba_remote_env_prefix
+"""
+        result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("THREAD_CLUSTER_DEFAULT_NAME=other", result.stdout)
+        self.assertIn("THREAD_CLUSTER_DEFAULT_CPUS=64-95", result.stdout)
+
+    def test_suite_summarizer_aggregates_runs_by_profile_and_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite = Path(tmp) / "suite"
+            rows = [
+                ("baseline", "t16", 1, 100.0, 1000.0, 2000.0, 3000.0),
+                ("baseline", "t16", 2, 110.0, 900.0, 1900.0, 2900.0),
+                ("numa_node1", "t16", 1, 120.0, 800.0, 1800.0, 2800.0),
+                ("cluster_hot_node3_other_node2", "t16", 1, 130.0, 700.0, 1700.0, 2700.0),
+            ]
+            for profile, load, round_id, throughput, avg, p95, p99 in rows:
+                run = suite / "runs" / f"{profile}-{load}-r{round_id}"
+                run.mkdir(parents=True)
+                (run / "summary.csv").write_text(
+                    "label,round,clients,threads_per_client,total_threads,ops_per_client,client_logs,throughput,runtime_ms_max,read_ops,avg_latency,p95_latency,p99_latency,p999_latency,error_count,timeout_count\n"
+                    f"{load},r1,1,16,16,1000,1,{throughput},1000,1000,{avg},{p95},{p99},{p99},0,0\n",
+                    encoding="utf-8",
+                )
+                tc = run / "server" / load / "r1" / "thread-cluster"
+                tc.mkdir(parents=True)
+                tc_summary = "rule,bound_threads,after_ycsb_threads,on_target_cpu_threads,new_threads,missing_threads,hit_ratio,thread_set_state\n"
+                if profile == "cluster_hot_node3_other_node2":
+                    tc_summary += "hot,2,2,2,0,0,1.000000,stable\nother,1,1,1,0,0,1.000000,stable\n"
+                elif profile == "numa_node1":
+                    tc_summary += "all,3,3,3,0,0,1.000000,stable\n"
+                (tc / "summary.csv").write_text(tc_summary, encoding="utf-8")
+
+            result = subprocess.run(
+                ["python3", str(ROOT / "tools" / "summarize-suite.py"), "--suite-dir", str(suite)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with (suite / "suite-summary-by-profile-load.csv").open(newline="", encoding="utf-8") as fh:
+                agg = {(row["profile"], row["load"]): row for row in csv.DictReader(fh)}
+            baseline = agg[("baseline", "t16")]
+            self.assertEqual(baseline["rounds"], "2")
+            self.assertEqual(float(baseline["throughput_mean"]), 105.0)
+            cluster = agg[("cluster_hot_node3_other_node2", "t16")]
+            self.assertAlmostEqual(float(cluster["vs_baseline_pct"]), 23.809524, places=5)
+            self.assertAlmostEqual(float(cluster["vs_numa_node1_pct"]), 8.333333, places=5)
+            tc_text = (suite / "thread-cluster-suite-summary.csv").read_text(encoding="utf-8")
+            self.assertIn("cluster_hot_node3_other_node2,t16,r1,hot,2,2,2,0,0,1.000000,stable", tc_text)
+            report = (suite / "ycsb-doris-dualhost-thread-cluster-node3-node2-x3-report-cn.md").read_text(encoding="utf-8")
+            self.assertIn("## 关键结论", report)
+            self.assertIn("cluster_hot_node3_other_node2 在 t16 下相对 baseline 吞吐 +23.81%", report)
+            self.assertIn("相对 numa_node1 +8.33%", report)
+
 
 if __name__ == "__main__":
     unittest.main()

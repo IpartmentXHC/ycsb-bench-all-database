@@ -124,6 +124,12 @@ yba_write_meta_common() {
         echo "CLIENT_CGROUP=$CLIENT_CGROUP"
         echo "ENABLE_THREAD_CLUSTER=$ENABLE_THREAD_CLUSTER"
         echo "THREAD_CLUSTER_RULES=$THREAD_CLUSTER_RULES"
+        echo "THREAD_CLUSTER_STRICT=$THREAD_CLUSTER_STRICT"
+        echo "THREAD_CLUSTER_MIN_HIT_RATIO=$THREAD_CLUSTER_MIN_HIT_RATIO"
+        echo "THREAD_CLUSTER_STRICT_RULES=$THREAD_CLUSTER_STRICT_RULES"
+        echo "THREAD_CLUSTER_REQUIRE_STABLE=$THREAD_CLUSTER_REQUIRE_STABLE"
+        echo "THREAD_CLUSTER_DEFAULT_NAME=$THREAD_CLUSTER_DEFAULT_NAME"
+        echo "THREAD_CLUSTER_DEFAULT_CPUS=$THREAD_CLUSTER_DEFAULT_CPUS"
     } > "$run_dir/meta/config-effective.env"
     if [ "$ENABLE_CGROUP" = "1" ]; then
         {
@@ -275,6 +281,7 @@ yba_run_one_local() {
     if ! yba_run_ycsb_clients "$run_dir" "$clients" "$threads"; then
         rc=1
     fi
+    yba_check_thread_cluster_static "$run_dir"
     yba_stop_metrics "$run_dir"
     yba_collect_server_logs "$run_dir"
     ps -eo pid,tid,psr,pcpu,pmem,comm,args --sort=-pcpu | head -200 > "$run_dir/metrics/ps-thread-after.log" 2>&1 || true
@@ -343,7 +350,7 @@ EOF
             else
                 rc=1
             fi
-            yba_host_run "$SERVER_HOST" "$(yba_remote_env_prefix) bash -lc '$(yba_remote_source_common); yba_apply_defaults; run_dir=\"\$EXPERIMENT_DIR/server/$(yba_quote "$label")/r$(yba_quote "$round")\"; yba_stop_metrics \"\$run_dir\"; yba_collect_server_logs \"\$run_dir\"'" || true
+            yba_host_run "$SERVER_HOST" "$(yba_remote_env_prefix) bash -lc '$(yba_remote_source_common); yba_apply_defaults; run_dir=\"\$EXPERIMENT_DIR/server/$(yba_quote "$label")/r$(yba_quote "$round")\"; yba_check_thread_cluster_static \"\$run_dir\"; yba_stop_metrics \"\$run_dir\"; yba_collect_server_logs \"\$run_dir\"'" || rc=1
             [ "$rc" = "0" ] || break 2
         done
     done

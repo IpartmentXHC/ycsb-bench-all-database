@@ -266,26 +266,250 @@ yba_snapshot_server_cgroup() {
     done
 }
 
-yba_apply_thread_cluster() {
+yba_cpu_in_list() {
+    local cpu=$1
+    local list=$2
+    local part start end
+    IFS=',' read -ra parts <<< "$list"
+    for part in "${parts[@]}"; do
+        [ -n "$part" ] || continue
+        if [[ "$part" == *-* ]]; then
+            start=${part%-*}
+            end=${part#*-}
+            if [ "$cpu" -ge "$start" ] 2>/dev/null && [ "$cpu" -le "$end" ] 2>/dev/null; then
+                return 0
+            fi
+        elif [ "$cpu" = "$part" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+yba_thread_cluster_rules_file() {
+    local dir=$1
+    mkdir -p "$dir/thread-cluster"
+    local file="$dir/thread-cluster/rules.tsv"
+    : > "$file"
+    local rule name rest regex cpus
+    for rule in $THREAD_CLUSTER_RULES; do
+        name=${rule%%:*}
+        rest=${rule#*:}
+        regex=${rest%:*}
+        cpus=${rest##*:}
+        [ -n "$name" ] && [ -n "$regex" ] && [ -n "$cpus" ] || yba_die "bad THREAD_CLUSTER_RULES item: $rule"
+        printf '%s\t%s\t%s\n' "$name" "$regex" "$cpus" >> "$file"
+    done
+    if [ -n "$THREAD_CLUSTER_DEFAULT_CPUS" ]; then
+        printf '%s\t%s\t%s\n' "$THREAD_CLUSTER_DEFAULT_NAME" ".*" "$THREAD_CLUSTER_DEFAULT_CPUS" >> "$file"
+    fi
+    printf '%s\n' "$file"
+}
+
+yba_snapshot_thread_cluster_matches() {
+    local dir=$1
+    local phase=$2
+    [ "$ENABLE_THREAD_CLUSTER" = "1" ] || return 0
+    [ -n "$THREAD_CLUSTER_RULES$THREAD_CLUSTER_DEFAULT_CPUS" ] || return 0
+    mkdir -p "$dir/thread-cluster"
+    local rules_file="$dir/thread-cluster/rules.tsv"
+    [ -f "$rules_file" ] || rules_file=$(yba_thread_cluster_rules_file "$dir")
+    local out="$dir/thread-cluster/${phase}-matches.csv"
+    echo "phase,rule,pid,tid,comm,target_cpus,psr,on_target_cpu" > "$out"
+    local actions_file="$dir/thread-cluster/actions.csv"
+    local pid rule regex cpus tid comm psr on_target pid_actions pid_threads
+    if [ -f "$actions_file" ]; then
+        cut -d, -f2 "$actions_file" | tail -n +2 | sort -u | while read -r pid; do
+            [ -n "$pid" ] || continue
+            pid_actions=$(mktemp)
+            pid_threads=$(mktemp)
+            awk -F, -v pid="$pid" 'NR > 1 && $2 == pid {print $0}' "$actions_file" > "$pid_actions"
+            ps -T -p "$pid" -o tid=,comm=,psr= 2>/dev/null > "$pid_threads" || true
+            awk -F, -v phase="$phase" -v threads="$pid_threads" '
+                BEGIN {
+                    while ((getline line < threads) > 0) {
+                        gsub(/^[[:space:]]+/, "", line)
+                        split(line, fields, /[[:space:]]+/)
+                        tid = fields[1]
+                        psr[tid] = fields[length(fields)]
+                        name = fields[2]
+                        for (idx = 3; idx < length(fields); idx++) {
+                            name = name " " fields[idx]
+                        }
+                        comm[tid] = name
+                    }
+                }
+                {
+                    rule=$1; pid=$2; tid=$3; target=$5
+                    if (!(tid in psr)) {
+                        next
+                    }
+                    on_target = cpu_in_list(psr[tid], target)
+                    printf "%s,%s,%s,%s,%s,%s,%s,%s\n", phase, rule, pid, tid, comm[tid], target, psr[tid], on_target
+                }
+                function cpu_in_list(cpu, list, parts, n, i, bounds) {
+                    n = split(list, parts, ",")
+                    for (i = 1; i <= n; i++) {
+                        if (parts[i] ~ /-/) {
+                            split(parts[i], bounds, "-")
+                            if (cpu >= bounds[1] && cpu <= bounds[2]) {
+                                return 1
+                            }
+                        } else if (cpu == parts[i]) {
+                            return 1
+                        }
+                    }
+                    return 0
+                }
+            ' "$pid_actions" >> "$out"
+            rm -f "$pid_actions" "$pid_threads"
+        done
+        return 0
+    fi
+    while IFS=$'\t' read -r rule regex cpus; do
+        [ -n "$rule" ] || continue
+        for pid in $(bash -lc "$SERVER_PID_COMMAND" 2>/dev/null || true); do
+            ps -T -p "$pid" -o tid=,comm=,psr= 2>/dev/null | awk -v re="$regex" '$2 ~ re {print $1, $2, $3}' |
+                while read -r tid comm psr; do
+                    [ -n "$tid" ] || continue
+                    on_target=0
+                    if yba_cpu_in_list "$psr" "$cpus"; then
+                        on_target=1
+                    fi
+                    printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$phase" "$rule" "$pid" "$tid" "$comm" "$cpus" "$psr" "$on_target" >> "$out"
+                done
+        done
+    done < "$rules_file"
+}
+
+yba_thread_cluster_summarize_rule() {
+    local rule=$1
+    local before_file=$2
+    local after_file=$3
+    awk -F, -v rule="$rule" '
+        FNR == NR {
+            if (NR > 1 && $2 == rule) {
+                before[$4] = 1
+                before_count++
+            }
+            next
+        }
+        FNR > 1 && $2 == rule {
+            after[$4] = 1
+            after_count++
+            if ($8 == "1") {
+                on_target++
+            }
+        }
+        END {
+            for (tid in after) {
+                if (!(tid in before)) {
+                    new_count++
+                }
+            }
+            for (tid in before) {
+                if (!(tid in after)) {
+                    missing_count++
+                }
+            }
+            hit_ratio = after_count ? on_target / after_count : 0
+            state = (new_count == 0 && missing_count == 0) ? "stable" : "changed"
+            printf "%s,%d,%d,%d,%d,%d,%.6f,%s\n", rule, before_count, after_count, on_target, new_count, missing_count, hit_ratio, state
+        }
+    ' "$before_file" "$after_file"
+}
+
+yba_thread_cluster_rule_is_strict() {
+    local rule=$1
+    local item strict_rules
+    if [ -z "$THREAD_CLUSTER_STRICT_RULES" ]; then
+        return 0
+    fi
+    strict_rules=${THREAD_CLUSTER_STRICT_RULES//,/ }
+    for item in $strict_rules; do
+        if [ "$item" = "$rule" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+yba_check_thread_cluster_static() {
     [ "$ENABLE_THREAD_CLUSTER" = "1" ] || return 0
     [ -n "$THREAD_CLUSTER_RULES" ] || return 0
     local dir=$1
     mkdir -p "$dir/thread-cluster"
-    local pid rule name regex cpus tid
+    local rules_file="$dir/thread-cluster/rules.tsv"
+    [ -f "$rules_file" ] || rules_file=$(yba_thread_cluster_rules_file "$dir")
+    yba_snapshot_thread_cluster_matches "$dir" after-ycsb
+    local before_file="$dir/thread-cluster/after-bind-matches.csv"
+    local after_file="$dir/thread-cluster/after-ycsb-matches.csv"
+    local summary="$dir/thread-cluster/summary.csv"
+    echo "rule,bound_threads,after_ycsb_threads,on_target_cpu_threads,new_threads,missing_threads,hit_ratio,thread_set_state" > "$summary"
+    local rule regex cpus line failed=0 action_rule rule_failed
+    if [ -f "$dir/thread-cluster/actions.csv" ]; then
+        while read -r action_rule; do
+            [ -n "$action_rule" ] || continue
+            if yba_thread_cluster_rule_is_strict "$action_rule"; then
+                failed=1
+            fi
+        done < <(awk -F, 'NR > 1 && $6 != "bound" {print $1}' "$dir/thread-cluster/actions.csv" | sort -u)
+    fi
+    while IFS=$'\t' read -r rule regex cpus; do
+        [ -n "$rule" ] || continue
+        line=$(yba_thread_cluster_summarize_rule "$rule" "$before_file" "$after_file")
+        echo "$line" >> "$summary"
+        rule_failed=0
+        IFS=, read -r _ bound after on_target new_count missing_count hit_ratio state <<< "$line"
+        if awk -v hit="$hit_ratio" -v min="$THREAD_CLUSTER_MIN_HIT_RATIO" 'BEGIN { exit !(hit < min) }'; then
+            rule_failed=1
+        fi
+        if [ "$THREAD_CLUSTER_REQUIRE_STABLE" = "1" ] && [ "$state" != "stable" ]; then
+            rule_failed=1
+        fi
+        if [ "$bound" = "0" ]; then
+            rule_failed=1
+        fi
+        if [ "$rule_failed" = "1" ] && yba_thread_cluster_rule_is_strict "$rule"; then
+            failed=1
+        fi
+    done < "$rules_file"
+    if [ "$THREAD_CLUSTER_STRICT" = "1" ] && [ "$failed" = "1" ]; then
+        yba_die "thread cluster verification failed; see $summary"
+    fi
+}
+
+yba_apply_thread_cluster() {
+    [ "$ENABLE_THREAD_CLUSTER" = "1" ] || return 0
+    [ -n "$THREAD_CLUSTER_RULES$THREAD_CLUSTER_DEFAULT_CPUS" ] || return 0
+    local dir=$1
+    mkdir -p "$dir/thread-cluster"
+    local rules_file
+    rules_file=$(yba_thread_cluster_rules_file "$dir")
+    echo "rule,pid,tid,comm,target_cpus,status" > "$dir/thread-cluster/actions.csv"
+    local pid name regex cpus tid comm status default_name matched_file
+    default_name=$THREAD_CLUSTER_DEFAULT_NAME
+    matched_file="$dir/thread-cluster/explicit-matched-tids.txt"
+    : > "$matched_file"
     for pid in $(bash -lc "$SERVER_PID_COMMAND" 2>/dev/null || true); do
         ps -T -p "$pid" -o tid=,comm= > "$dir/thread-cluster/before-${pid}.txt" || true
-        for rule in $THREAD_CLUSTER_RULES; do
-            name=${rule%%:*}
-            rest=${rule#*:}
-            regex=${rest%:*}
-            cpus=${rest##*:}
-            ps -T -p "$pid" -o tid=,comm= | awk -v re="$regex" '$2 ~ re {print $1}' |
-                while read -r tid; do
+        while IFS=$'\t' read -r name regex cpus; do
+            ps -T -p "$pid" -o tid=,comm= | awk -v re="$regex" '$2 ~ re {print $1, $2}' |
+                while read -r tid comm; do
                     [ -n "$tid" ] || continue
+                    if [ -n "$THREAD_CLUSTER_DEFAULT_CPUS" ] && [ "$name" = "$default_name" ] && grep -qx "$pid:$tid" "$matched_file"; then
+                        continue
+                    fi
                     echo "$name pid=$pid tid=$tid cpus=$cpus" >> "$dir/thread-cluster/actions.log"
-                    taskset -pc "$cpus" "$tid" >> "$dir/thread-cluster/actions.log" 2>&1 || true
+                    status=bound
+                    taskset -pc "$cpus" "$tid" >> "$dir/thread-cluster/actions.log" 2>&1 || status=failed
+                    printf '%s,%s,%s,%s,%s,%s\n' "$name" "$pid" "$tid" "$comm" "$cpus" "$status" >> "$dir/thread-cluster/actions.csv"
+                    if [ "$name" != "$default_name" ]; then
+                        printf '%s:%s\n' "$pid" "$tid" >> "$matched_file"
+                    fi
                 done
-        done
+        done < "$rules_file"
         ps -T -p "$pid" -o tid=,comm=,psr= > "$dir/thread-cluster/after-${pid}.txt" || true
     done
+    yba_snapshot_thread_cluster_matches "$dir" after-bind
 }
