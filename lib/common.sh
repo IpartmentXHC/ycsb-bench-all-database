@@ -81,7 +81,28 @@ yba_apply_defaults() {
     PYTHON2_BIN=${PYTHON2_BIN:-python2}
     PYTHON2_LD_LIBRARY_PATH=${PYTHON2_LD_LIBRARY_PATH:-}
 
-    JDBC_URL=${JDBC_URL:-jdbc:mysql://127.0.0.1:9030/ycsb?useSSL=false}
+    CLICKHOUSE_HOME=${CLICKHOUSE_HOME:-/home/xhc/clickhouse}
+    CLICKHOUSE_BIN=${CLICKHOUSE_BIN:-$CLICKHOUSE_HOME/ClickHouse/build/programs/clickhouse}
+    CLICKHOUSE_CLIENT=${CLICKHOUSE_CLIENT:-$CLICKHOUSE_HOME/ClickHouse/build/programs/clickhouse-client}
+    CLICKHOUSE_CONFIG=${CLICKHOUSE_CONFIG:-$CLICKHOUSE_HOME/etc/config.xml}
+    CLICKHOUSE_HOST=${CLICKHOUSE_HOST:-127.0.0.1}
+    CLICKHOUSE_JDBC_HOST=${CLICKHOUSE_JDBC_HOST:-$CLICKHOUSE_HOST}
+    CLICKHOUSE_TCP_PORT=${CLICKHOUSE_TCP_PORT:-9000}
+    CLICKHOUSE_MYSQL_PORT=${CLICKHOUSE_MYSQL_PORT:-9004}
+    CLICKHOUSE_LOG_DIR=${CLICKHOUSE_LOG_DIR:-/tmp/yba-clickhouse}
+    CLICKHOUSE_NUMA_NODE=${CLICKHOUSE_NUMA_NODE:-1}
+    CLICKHOUSE_MODE=${CLICKHOUSE_MODE:-unrestricted}
+
+    if [ -z "${JDBC_URL:-}" ]; then
+        case "$DB_TYPE" in
+            clickhouse)
+                JDBC_URL="jdbc:mysql://${CLICKHOUSE_JDBC_HOST}:${CLICKHOUSE_MYSQL_PORT}/ycsb?useSSL=false&autoReconnect=true&characterEncoding=utf8&serverTimezone=UTC"
+                ;;
+            *)
+                JDBC_URL="jdbc:mysql://127.0.0.1:9030/ycsb?useSSL=false"
+                ;;
+        esac
+    fi
     JDBC_USER=${JDBC_USER:-root}
     JDBC_PASSWORD=${JDBC_PASSWORD:-}
     JDBC_DRIVER=${JDBC_DRIVER:-com.mysql.cj.jdbc.Driver}
@@ -99,7 +120,16 @@ yba_apply_defaults() {
     UPDATE_PROPORTION=${UPDATE_PROPORTION:-0}
     SCAN_PROPORTION=${SCAN_PROPORTION:-0}
     INSERT_PROPORTION=${INSERT_PROPORTION:-0}
-    INSERT_ORDER=${INSERT_ORDER:-ordered}
+    if [ -z "${INSERT_ORDER:-}" ]; then
+        case "$DB_TYPE" in
+            clickhouse)
+                INSERT_ORDER=hashed
+                ;;
+            *)
+                INSERT_ORDER=ordered
+                ;;
+        esac
+    fi
 
     MATRIX=${MATRIX:-t80:5:16}
     ROUNDS=${ROUNDS:-1}
@@ -130,8 +160,6 @@ yba_apply_defaults() {
     DORIS_SWAPOFF_WITH_SUDO=${DORIS_SWAPOFF_WITH_SUDO:-0}
     DORIS_PROC_SWAPS=${DORIS_PROC_SWAPS:-/proc/swaps}
 
-    CLICKHOUSE_HOME=${CLICKHOUSE_HOME:-}
-
     ENABLE_THREAD_CLUSTER=${ENABLE_THREAD_CLUSTER:-0}
     THREAD_CLUSTER_RULES=${THREAD_CLUSTER_RULES:-}
     THREAD_CLUSTER_STRICT=${THREAD_CLUSTER_STRICT:-0}
@@ -140,13 +168,14 @@ yba_apply_defaults() {
     THREAD_CLUSTER_REQUIRE_STABLE=${THREAD_CLUSTER_REQUIRE_STABLE:-1}
     THREAD_CLUSTER_DEFAULT_NAME=${THREAD_CLUSTER_DEFAULT_NAME:-other}
     THREAD_CLUSTER_DEFAULT_CPUS=${THREAD_CLUSTER_DEFAULT_CPUS:-}
+    THREAD_CLUSTER_TASKSET_WITH_SUDO=${THREAD_CLUSTER_TASKSET_WITH_SUDO:-0}
     if [ -z "${SERVER_PID_COMMAND+x}" ]; then
         case "$DB_TYPE" in
             doris)
                 SERVER_PID_COMMAND='pgrep -x doris_be; pgrep -f "org[.]apache[.]doris[.]DorisFE"'
                 ;;
             clickhouse)
-                SERVER_PID_COMMAND='pgrep -x clickhouse-server'
+                SERVER_PID_COMMAND="pgrep -f \"clickhouse.*server.*--config-file=${CLICKHOUSE_CONFIG}\""
                 ;;
             *)
                 SERVER_PID_COMMAND='pgrep -x doris_be'
@@ -159,12 +188,24 @@ yba_apply_defaults() {
     SERVER_READY_CMD=${SERVER_READY_CMD:-}
     if [ -z "$SERVER_READY_CMD" ] && [ "$DB_TYPE" = "doris" ]; then
         SERVER_READY_CMD=$DORIS_READY_CMD
+    elif [ -z "$SERVER_READY_CMD" ] && [ "$DB_TYPE" = "clickhouse" ]; then
+        SERVER_READY_CMD="$CLICKHOUSE_CLIENT --host $CLICKHOUSE_HOST --port $CLICKHOUSE_TCP_PORT --query \"SELECT 1\""
     fi
     SERVER_READY_TIMEOUT=${SERVER_READY_TIMEOUT:-120}
     SERVER_READY_INTERVAL=${SERVER_READY_INTERVAL:-2}
     CLEANUP_SERVER=${CLEANUP_SERVER:-1}
-    if [ -z "${SERVER_WARNING_LOG_GLOB+x}" ] && [ "$DB_TYPE" = "doris" ]; then
-        SERVER_WARNING_LOG_GLOB="$DORIS_HOME/be/log/be*.log"
+    if [ -z "${SERVER_WARNING_LOG_GLOB+x}" ]; then
+        case "$DB_TYPE" in
+            doris)
+                SERVER_WARNING_LOG_GLOB="$DORIS_HOME/be/log/be*.log"
+                ;;
+            clickhouse)
+                SERVER_WARNING_LOG_GLOB="$CLICKHOUSE_LOG_DIR/clickhouse*.err"
+                ;;
+            *)
+                SERVER_WARNING_LOG_GLOB=
+                ;;
+        esac
     else
         SERVER_WARNING_LOG_GLOB=${SERVER_WARNING_LOG_GLOB:-}
     fi

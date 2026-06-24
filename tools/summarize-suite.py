@@ -148,7 +148,7 @@ def md_table(rows, fields):
     return "\n".join(lines)
 
 
-def build_key_findings(agg_rows, thread_rows, hot_node_cpus, other_node_cpus):
+def build_key_findings(agg_rows, thread_rows, hot_node_cpus, other_node_cpus, database_name):
     lines = ["## 关键结论", ""]
     by_profile_load = {(row.get("profile"), row.get("load")): row for row in agg_rows}
     loads = sorted({row.get("load") for row in agg_rows if row.get("load")})
@@ -169,10 +169,22 @@ def build_key_findings(agg_rows, thread_rows, hot_node_cpus, other_node_cpus):
                     p99=fnum(cluster.get("p99_latency_mean")),
                 )
             )
-        if numa and baseline:
+        if not cluster and baseline and numa:
+            lines.append(
+                "- numa_node1 在 {load} 下相对 baseline 吞吐 {vs_base:+.2f}%；baseline/numa 平均吞吐为 "
+                "{base_tput:.2f}/{numa_tput:.2f} ops/s，P95/P99 为 {p95:.0f}/{p99:.0f} us。".format(
+                    load=load,
+                    vs_base=fnum(numa.get("vs_baseline_pct")),
+                    base_tput=fnum(baseline.get("throughput_mean")),
+                    numa_tput=fnum(numa.get("throughput_mean")),
+                    p95=fnum(numa.get("p95_latency_mean")),
+                    p99=fnum(numa.get("p99_latency_mean")),
+                )
+            )
+        if cluster and numa and baseline:
             lines.append(
                 "- numa_node1 在 {load} 下相对 baseline 吞吐 {vs_base:+.2f}%，说明单 node 聚集本身有效；"
-                "但它把 BE 全部压到 node1，可能比只聚集高共享线程组更容易产生 node 内争用。".format(
+                "但它把服务进程全部压到 node1，可能比只聚集高共享线程组更容易产生 node 内争用。".format(
                     load=load,
                     vs_base=fnum(numa.get("vs_baseline_pct")),
                 )
@@ -212,28 +224,28 @@ def build_key_findings(agg_rows, thread_rows, hot_node_cpus, other_node_cpus):
         )
     lines.extend(
         [
-            "- 阶段性判断：在这组中低负载双机 YCSB read-only 实验里，线程组级聚集不仅优于 baseline，也优于整进程 node1 NUMA control；更像是减少了高共享查询链路线程的跨 node 同步/唤醒成本，同时避免把全部 BE 线程都挤到同一 node。",
+            f"- 阶段性判断：这组双机 YCSB read-only 实验用于比较 {database_name} baseline 与 NUMA control；是否继续做线程聚集，需要结合吞吐、P95/P99 和服务端 node CPU busy 判断。",
             "",
         ]
     )
     return lines
 
 
-def build_report(suite_dir, rows, agg_rows, thread_rows, server_host, client_host, hot_node_cpus, other_node_cpus, numa_control_cpus):
+def build_report(suite_dir, rows, agg_rows, thread_rows, server_host, client_host, hot_node_cpus, other_node_cpus, numa_control_cpus, database_name, report_title):
     report = [
-        "# Doris/YCSB 双机线程聚集 Node3/Node2 复验报告",
+        f"# {report_title}",
         "",
         "## 实验概况",
         "",
         f"- Suite directory: `{suite_dir}`",
         f"- Runs discovered: `{len(rows)}`",
-        f"- 服务端：`{server_host}` Doris；客户端：`{client_host}` YCSB。",
-        "- Profile：baseline、numa_node1、cluster_hot_node3_other_node2。",
+        f"- 服务端：`{server_host}` {database_name}；客户端：`{client_host}` YCSB。",
+        "- Profile：baseline、numa_node1，以及可选线程聚集 profile。",
         "- Load：t16 与 t80；每个 profile/load 3 轮。",
         f"- CPU 配置：numa control `{numa_control_cpus}`；hot `{hot_node_cpus}`；other `{other_node_cpus}`。",
         "",
     ]
-    report.extend(build_key_findings(agg_rows, thread_rows, hot_node_cpus, other_node_cpus))
+    report.extend(build_key_findings(agg_rows, thread_rows, hot_node_cpus, other_node_cpus, database_name))
     report.extend(
         [
         "## 每轮结果",
@@ -250,9 +262,9 @@ def build_report(suite_dir, rows, agg_rows, thread_rows, server_host, client_hos
         "",
         "## 注意事项",
         "",
-        "- 本轮是用户态一次性线程聚集，不是持续守护；若 Doris 后续动态创建新的目标线程，仍需要周期性补绑或 cgroup/线程级迁移机制。",
-        "- cluster profile 中 other 线程组没有达到严格隔离，只作为背景线程尽力迁出 node3 的证据记录。",
-        "- 本轮只覆盖 t16/t80 read-only zipfian YCSB，不直接外推到更高负载、写入型 workload 或 ClickHouse。",
+        f"- 本轮只覆盖 t16/t80 read-only zipfian YCSB，不直接外推到更高负载或写入型 {database_name} workload。",
+        "- 如果启用了线程聚集 profile，它仍是用户态一次性放置，不是持续守护。",
+        "- NUMA control 同时包含 CPU 和 memory binding，和只做 CPU affinity 的实验含义不同。",
         "",
         ]
     )
@@ -267,6 +279,11 @@ def main():
     parser.add_argument("--hot-node-cpus", default="96-127")
     parser.add_argument("--other-node-cpus", default="64-95")
     parser.add_argument("--numa-control-cpus", default="32-63")
+    parser.add_argument("--database-name", default="Doris")
+    parser.add_argument("--report-title", default="Doris/YCSB 双机线程聚集 Node3/Node2 复验报告")
+    parser.add_argument("--report-file", default="")
+    parser.add_argument("--summary-file", default="")
+    parser.add_argument("--aggregate-file", default="")
     args = parser.parse_args()
     suite_dir = Path(args.suite_dir).resolve()
 
@@ -274,13 +291,17 @@ def main():
     agg_rows = aggregate(rows)
     thread_rows = discover_thread_rows(suite_dir)
 
+    summary_file = Path(args.summary_file) if args.summary_file else suite_dir / "suite-summary.csv"
+    aggregate_file = Path(args.aggregate_file) if args.aggregate_file else suite_dir / "suite-summary-by-profile-load.csv"
+    report_file = Path(args.report_file) if args.report_file else suite_dir / "ycsb-doris-dualhost-thread-cluster-node3-node2-x3-report-cn.md"
+
     write_csv(
-        suite_dir / "suite-summary.csv",
+        summary_file,
         rows,
         ["profile", "load", "round", "status", "clients", "threads_per_client", "total_threads", "ops_per_client", "throughput", "avg_latency", "p95_latency", "p99_latency", "p999_latency", "error_count", "timeout_count"],
     )
     write_csv(
-        suite_dir / "suite-summary-by-profile-load.csv",
+        aggregate_file,
         agg_rows,
         ["profile", "load", "rounds", "throughput_mean", "throughput_stdev", "throughput_min", "throughput_max", "avg_latency_mean", "p95_latency_mean", "p99_latency_mean", "vs_baseline_pct", "vs_numa_node1_pct"],
     )
@@ -289,7 +310,7 @@ def main():
         thread_rows,
         ["profile", "load", "round", "rule", "bound_threads", "after_ycsb_threads", "on_target_cpu_threads", "new_threads", "missing_threads", "hit_ratio", "thread_set_state"],
     )
-    (suite_dir / "ycsb-doris-dualhost-thread-cluster-node3-node2-x3-report-cn.md").write_text(
+    report_file.write_text(
         build_report(
             suite_dir,
             rows,
@@ -300,6 +321,8 @@ def main():
             args.hot_node_cpus,
             args.other_node_cpus,
             args.numa_control_cpus,
+            args.database_name,
+            args.report_title,
         ),
         encoding="utf-8",
     )

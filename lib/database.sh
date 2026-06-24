@@ -28,7 +28,7 @@ yba_database_setup_server() {
             yba_doris_start
             ;;
         clickhouse)
-            yba_die "ClickHouse default start is not configured; set SERVER_SETUP_CMD for now"
+            yba_clickhouse_start
             ;;
         *)
             yba_die "DB_TYPE must be doris or clickhouse, got: $DB_TYPE"
@@ -50,7 +50,7 @@ yba_database_cleanup_server() {
             yba_doris_stop
             ;;
         clickhouse)
-            return 0
+            yba_clickhouse_stop
             ;;
     esac
 }
@@ -113,7 +113,86 @@ yba_doris_stop() {
 }
 
 yba_clickhouse_preflight() {
-    if [ -z "${SERVER_SETUP_CMD:-}" ]; then
-        yba_die "ClickHouse support is a template in this version; set SERVER_SETUP_CMD and SERVER_READY_CMD"
+    if [ -n "${SERVER_SETUP_CMD:-}" ]; then
+        return 0
     fi
+    test -x "$CLICKHOUSE_BIN" || yba_die "missing executable CLICKHOUSE_BIN: $CLICKHOUSE_BIN"
+    test -x "$CLICKHOUSE_CLIENT" || yba_die "missing executable CLICKHOUSE_CLIENT: $CLICKHOUSE_CLIENT"
+    test -f "$CLICKHOUSE_CONFIG" || yba_die "missing CLICKHOUSE_CONFIG: $CLICKHOUSE_CONFIG"
+    case "$CLICKHOUSE_MODE" in
+        unrestricted|node1|nodes:*) ;;
+        *) yba_die "CLICKHOUSE_MODE must be unrestricted, node1, or nodes:<comma-list>, got: $CLICKHOUSE_MODE" ;;
+    esac
+    if [ "$CLICKHOUSE_MODE" != "unrestricted" ]; then
+        command -v numactl >/dev/null 2>&1 || yba_die "numactl is required for CLICKHOUSE_MODE=$CLICKHOUSE_MODE"
+    fi
+}
+
+yba_clickhouse_numactl_prefix() {
+    local mode=${1:-$CLICKHOUSE_MODE}
+    local nodes
+    case "$mode" in
+        unrestricted)
+            return 0
+            ;;
+        node1)
+            printf 'numactl --cpunodebind=%s --membind=%s' "$CLICKHOUSE_NUMA_NODE" "$CLICKHOUSE_NUMA_NODE"
+            ;;
+        nodes:*)
+            nodes=${mode#nodes:}
+            [[ "$nodes" =~ ^[0-9]+(,[0-9]+)*$ ]] || yba_die "invalid CLICKHOUSE_MODE=$mode; expected nodes:<comma-separated-node-ids>"
+            printf 'numactl --cpunodebind=%s --membind=%s' "$nodes" "$nodes"
+            ;;
+        *)
+            yba_die "CLICKHOUSE_MODE must be unrestricted, node1, or nodes:<comma-list>, got: $mode"
+            ;;
+    esac
+}
+
+yba_clickhouse_pids() {
+    local escaped_config
+    escaped_config=$(printf '%s\n' "$CLICKHOUSE_CONFIG" | sed 's/[][\.^$*+?{}()|/]/\\&/g')
+    pgrep -f "clickhouse[[:space:]]+server.*--config-file=${escaped_config}" 2>/dev/null || true
+}
+
+yba_clickhouse_start() {
+    local prefix
+    yba_clickhouse_preflight
+    mkdir -p "$CLICKHOUSE_LOG_DIR"
+    yba_clickhouse_stop
+    prefix=$(yba_clickhouse_numactl_prefix "$CLICKHOUSE_MODE")
+    if [ -n "$prefix" ]; then
+        yba_log "starting ClickHouse with $prefix"
+        # shellcheck disable=SC2086
+        nohup $prefix "$CLICKHOUSE_BIN" server --config-file="$CLICKHOUSE_CONFIG" \
+            >"$CLICKHOUSE_LOG_DIR/clickhouse-${CLICKHOUSE_MODE}.out" \
+            2>"$CLICKHOUSE_LOG_DIR/clickhouse-${CLICKHOUSE_MODE}.err" &
+    else
+        yba_log "starting ClickHouse unrestricted"
+        nohup "$CLICKHOUSE_BIN" server --config-file="$CLICKHOUSE_CONFIG" \
+            >"$CLICKHOUSE_LOG_DIR/clickhouse-${CLICKHOUSE_MODE}.out" \
+            2>"$CLICKHOUSE_LOG_DIR/clickhouse-${CLICKHOUSE_MODE}.err" &
+    fi
+    disown
+}
+
+yba_clickhouse_stop() {
+    local pids pid i
+    pids=$(yba_clickhouse_pids)
+    if [ -z "$pids" ]; then
+        yba_log "no ClickHouse server for config: $CLICKHOUSE_CONFIG"
+        return 0
+    fi
+    yba_log "stopping ClickHouse pids: $pids"
+    # shellcheck disable=SC2086
+    kill $pids 2>/dev/null || true
+    for i in $(seq 1 30); do
+        sleep 1
+        if [ -z "$(yba_clickhouse_pids)" ]; then
+            return 0
+        fi
+    done
+    for pid in $pids; do
+        kill -KILL "$pid" 2>/dev/null || true
+    done
 }

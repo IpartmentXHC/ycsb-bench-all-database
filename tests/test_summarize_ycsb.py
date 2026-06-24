@@ -295,6 +295,138 @@ printf '%s\\n' "$SERVER_PID_COMMAND"
         self.assertIn("pgrep -x doris_be", result.stdout)
         self.assertIn('org[.]apache[.]doris[.]DorisFE', result.stdout)
 
+    def test_clickhouse_defaults_use_mysql_interface_and_native_ready_check(self):
+        script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+DB_TYPE=clickhouse
+yba_apply_defaults
+printf 'bin=%s\\n' "$CLICKHOUSE_BIN"
+printf 'client=%s\\n' "$CLICKHOUSE_CLIENT"
+printf 'config=%s\\n' "$CLICKHOUSE_CONFIG"
+printf 'tcp=%s\\n' "$CLICKHOUSE_TCP_PORT"
+printf 'mysql=%s\\n' "$CLICKHOUSE_MYSQL_PORT"
+printf 'mode=%s\\n' "$CLICKHOUSE_MODE"
+printf 'jdbc=%s\\n' "$JDBC_URL"
+printf 'driver=%s\\n' "$JDBC_DRIVER"
+printf 'jar=%s\\n' "$JDBC_JAR"
+printf 'ready=%s\\n' "$SERVER_READY_CMD"
+"""
+        result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("bin=/home/xhc/clickhouse/ClickHouse/build/programs/clickhouse", result.stdout)
+        self.assertIn("client=/home/xhc/clickhouse/ClickHouse/build/programs/clickhouse-client", result.stdout)
+        self.assertIn("config=/home/xhc/clickhouse/etc/config.xml", result.stdout)
+        self.assertIn("tcp=9000", result.stdout)
+        self.assertIn("mysql=9004", result.stdout)
+        self.assertIn("mode=unrestricted", result.stdout)
+        self.assertIn("jdbc=jdbc:mysql://127.0.0.1:9004/ycsb", result.stdout)
+        self.assertIn("driver=com.mysql.cj.jdbc.Driver", result.stdout)
+        self.assertIn("jar=/home/xhc/ycsb-jdbc-binding-0.17.0/lib/mysql-connector-java-8.0.28.jar", result.stdout)
+        self.assertIn("clickhouse-client", result.stdout)
+        self.assertIn("--query \"SELECT 1\"", result.stdout)
+
+    def test_clickhouse_defaults_to_hashed_insert_order(self):
+        script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+DB_TYPE=clickhouse
+yba_apply_defaults
+printf '%s\\n' "$INSERT_ORDER"
+"""
+        result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "hashed")
+
+    def test_clickhouse_default_pid_command_matches_configured_server_process(self):
+        script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+DB_TYPE=clickhouse
+CLICKHOUSE_CONFIG=/opt/clickhouse/etc/config.xml
+yba_apply_defaults
+printf '%s\\n' "$SERVER_PID_COMMAND"
+"""
+        result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("pgrep -f", result.stdout)
+        self.assertIn("clickhouse.*server", result.stdout)
+        self.assertIn("/opt/clickhouse/etc/config.xml", result.stdout)
+        self.assertNotIn("pgrep -x clickhouse-server", result.stdout)
+
+    def test_clickhouse_empty_jdbc_url_falls_back_to_mysql_interface_default(self):
+        script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+DB_TYPE=clickhouse
+JDBC_URL=
+CLICKHOUSE_JDBC_HOST=192.168.70.183
+yba_apply_defaults
+printf '%s\\n' "$JDBC_URL"
+"""
+        result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("jdbc:mysql://192.168.70.183:9004/ycsb", result.stdout)
+
+    def test_clickhouse_preflight_allows_default_start_when_files_exist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "clickhouse"
+            bin_dir = root / "bin"
+            etc_dir = root / "etc"
+            bin_dir.mkdir(parents=True)
+            etc_dir.mkdir()
+            ch_bin = bin_dir / "clickhouse"
+            ch_client = bin_dir / "clickhouse-client"
+            for path in (ch_bin, ch_client):
+                path.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+                path.chmod(0o755)
+            config = etc_dir / "config.xml"
+            config.write_text("<clickhouse/>\n", encoding="utf-8")
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/database.sh"
+DB_TYPE=clickhouse
+CLICKHOUSE_BIN={str(ch_bin)!r}
+CLICKHOUSE_CLIENT={str(ch_client)!r}
+CLICKHOUSE_CONFIG={str(config)!r}
+yba_apply_defaults
+yba_database_preflight_server
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_remote_env_prefix_exports_clickhouse_settings(self):
+        script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/ssh.sh"
+DB_TYPE=clickhouse
+CLICKHOUSE_BIN=/opt/ch/clickhouse
+CLICKHOUSE_CLIENT=/opt/ch/clickhouse-client
+CLICKHOUSE_CONFIG=/opt/ch/config.xml
+CLICKHOUSE_MODE=node1
+CLICKHOUSE_NUMA_NODE=2
+CLICKHOUSE_MYSQL_PORT=9005
+yba_apply_defaults
+yba_remote_env_prefix
+"""
+        result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("DB_TYPE=clickhouse", result.stdout)
+        self.assertIn("CLICKHOUSE_BIN=/opt/ch/clickhouse", result.stdout)
+        self.assertIn("CLICKHOUSE_CLIENT=/opt/ch/clickhouse-client", result.stdout)
+        self.assertIn("CLICKHOUSE_CONFIG=/opt/ch/config.xml", result.stdout)
+        self.assertIn("CLICKHOUSE_MODE=node1", result.stdout)
+        self.assertIn("CLICKHOUSE_NUMA_NODE=2", result.stdout)
+        self.assertIn("CLICKHOUSE_MYSQL_PORT=9005", result.stdout)
+
     def test_new_doris_examples_are_sourceable_and_use_database_defaults(self):
         examples = [
             ROOT / "examples" / "doris" / "singlehost-baseline.env",
@@ -383,6 +515,53 @@ yba_preflight_host_ycsb localhost
             result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(marker.read_text(encoding="utf-8").strip(), "/custom/python/lib")
+
+    def test_ycsb_run_one_fails_when_raw_log_contains_not_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ycsb_home = Path(tmp) / "ycsb"
+            (ycsb_home / "bin").mkdir(parents=True)
+            (ycsb_home / "lib").mkdir()
+            ycsb_bin = ycsb_home / "bin" / "ycsb"
+            ycsb_bin.write_text(
+                """#!/usr/bin/env bash
+cat <<'EOF'
+[OVERALL], RunTime(ms), 10
+[OVERALL], Throughput(ops/sec), 100.0
+[READ], Operations, 0
+[READ], Return=NOT_FOUND, 1
+[READ-FAILED], Operations, 1
+EOF
+exit 0
+""",
+                encoding="utf-8",
+            )
+            ycsb_bin.chmod(0o755)
+            (ycsb_home / "lib" / "mysql.jar").write_text("", encoding="utf-8")
+            exp = Path(tmp) / "exp"
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/cgroup.sh"
+source "$YBA_ROOT/lib/metrics.sh"
+source "$YBA_ROOT/lib/report.sh"
+source "$YBA_ROOT/lib/ycsb.sh"
+YCSB_HOME={str(ycsb_home)!r}
+JDBC_JAR={str(ycsb_home / "lib" / "mysql.jar")!r}
+PYTHON2_BIN=bash
+EXPERIMENT_DIR={str(exp)!r}
+ENABLE_NODE_CPU_SAMPLER=0
+ENABLE_VMSTAT=0
+ENABLE_NUMASTAT=0
+SERVER_PID_COMMAND='true'
+yba_apply_defaults
+yba_write_jdbc_props
+yba_write_workload
+yba_run_one_local tbad 1 1 1
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("YCSB reported failed operations", result.stderr)
 
     def test_start_metrics_detaches_background_sampler_stdio(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -551,6 +730,52 @@ yba_check_thread_cluster_static {str(run_dir)!r}
             self.assertIn("query,3,3,3,0,0,1.000000,stable", summary)
             self.assertIn("background,1,1,1,0,0,1.000000,stable", summary)
 
+    def test_thread_cluster_taskset_can_use_sudo_askpass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fakebin = Path(tmp) / "bin"
+            fakebin.mkdir()
+            sudo_log = Path(tmp) / "sudo.log"
+            ps_script = fakebin / "ps"
+            ps_script.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "-T" ]; then
+  if printf '%s\n' "$*" | grep -q 'psr'; then
+    echo "101 clickhouse 96"
+    exit 0
+  fi
+  echo "101 clickhouse"
+  exit 0
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            ps_script.chmod(0o755)
+            sudo_script = fakebin / "sudo"
+            sudo_script.write_text(
+                f"#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> {str(sudo_log)!r}\nexit 0\n",
+                encoding="utf-8",
+            )
+            sudo_script.chmod(0o755)
+            run_dir = Path(tmp) / "run"
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/cgroup.sh"
+PATH={str(fakebin)!r}:$PATH
+SERVER_PID_COMMAND='printf "501\\n"'
+ENABLE_THREAD_CLUSTER=1
+THREAD_CLUSTER_RULES='all:.*:96-127'
+THREAD_CLUSTER_TASKSET_WITH_SUDO=1
+SUDO_ASKPASS=/tmp/askpass
+yba_apply_defaults
+yba_apply_thread_cluster {str(run_dir)!r}
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("-A taskset -pc 96-127 101", sudo_log.read_text(encoding="utf-8"))
+
     def test_thread_cluster_strict_mode_fails_when_thread_runs_outside_target_cpus(self):
         with tempfile.TemporaryDirectory() as tmp:
             fakebin = Path(tmp) / "bin"
@@ -597,6 +822,61 @@ yba_check_thread_cluster_static {str(run_dir)!r}
             result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("thread cluster verification failed", result.stderr)
+
+    def test_thread_cluster_static_check_uses_affinity_not_only_last_cpu(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fakebin = Path(tmp) / "bin"
+            fakebin.mkdir()
+            ps_script = fakebin / "ps"
+            ps_script.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "-T" ]; then
+  if printf '%s\n' "$*" | grep -q 'psr'; then
+    echo "101 clickhouse 2"
+    exit 0
+  fi
+  echo "101 clickhouse"
+  exit 0
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            ps_script.chmod(0o755)
+            taskset_script = fakebin / "taskset"
+            taskset_script.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "-pc" ] && [ "$#" = 2 ]; then
+  echo "pid $2's current affinity list: 96-127"
+  exit 0
+fi
+exit 0
+""",
+                encoding="utf-8",
+            )
+            taskset_script.chmod(0o755)
+            run_dir = Path(tmp) / "run"
+            script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r}
+source "$YBA_ROOT/lib/common.sh"
+source "$YBA_ROOT/lib/cgroup.sh"
+PATH={str(fakebin)!r}:$PATH
+SERVER_PID_COMMAND='printf "501\\n"'
+ENABLE_THREAD_CLUSTER=1
+THREAD_CLUSTER_RULES='all:.*:96-127'
+THREAD_CLUSTER_STRICT=1
+THREAD_CLUSTER_MIN_HIT_RATIO=1.0
+yba_apply_defaults
+yba_apply_thread_cluster {str(run_dir)!r}
+yba_check_thread_cluster_static {str(run_dir)!r}
+"""
+            result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            after_bind = (run_dir / "thread-cluster" / "after-bind-matches.csv").read_text(encoding="utf-8")
+            self.assertIn("after-bind,all,501,101,clickhouse,96-127,2,96-127,1", after_bind)
+            summary = (run_dir / "thread-cluster" / "summary.csv").read_text(encoding="utf-8")
+            self.assertIn("all,1,1,1,0,0,1.000000,stable", summary)
 
     def test_thread_cluster_can_ignore_thread_set_changes_when_disabled(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -855,8 +1135,8 @@ yba_check_thread_cluster_static {str(run_dir)!r}
             result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.assertEqual(result.returncode, 0, result.stderr)
             after_bind = (run_dir / "thread-cluster" / "after-bind-matches.csv").read_text(encoding="utf-8")
-            self.assertIn("after-bind,hot,501,101,brpc_light,96-127,96,1", after_bind)
-            self.assertIn("after-bind,other,501,102,other_worker,64-95,64,1", after_bind)
+            self.assertIn("after-bind,hot,501,101,brpc_light,96-127,96,,1", after_bind)
+            self.assertIn("after-bind,other,501,102,other_worker,64-95,64,,1", after_bind)
 
     def test_thread_cluster_static_check_parses_comm_with_spaces(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -902,7 +1182,7 @@ yba_check_thread_cluster_static {str(run_dir)!r}
             result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.assertEqual(result.returncode, 0, result.stderr)
             after_bind = (run_dir / "thread-cluster" / "after-bind-matches.csv").read_text(encoding="utf-8")
-            self.assertIn("after-bind,other,501,101,Gang worker#0,64-95,64,1", after_bind)
+            self.assertIn("after-bind,other,501,101,Gang worker#0,64-95,64,,1", after_bind)
 
     def test_remote_env_prefix_exports_thread_cluster_default_settings(self):
         script = f"""
@@ -1023,6 +1303,41 @@ JDBC_URL='jdbc:mysql://10.0.0.1:9030/ycsb' \\
         self.assertIn("SERVER_HOST=db-host", result.stdout)
         self.assertIn("CLIENT_HOST=ycsb-host", result.stdout)
         self.assertIn("JDBC_URL=jdbc:mysql://10.0.0.1:9030/ycsb", result.stdout)
+
+    def test_clickhouse_suite_runner_prints_overridden_config(self):
+        script = f"""
+set -euo pipefail
+YBA_ROOT={str(ROOT)!r} \\
+CONFIG=/tmp/clickhouse.env \\
+SUITE_NAME=clickhouse-suite \\
+SUITE_LOADS='small:t2:1:2' \\
+SUITE_ROUNDS=2 \\
+SUITE_PROFILES='baseline numa_node1' \\
+CLICKHOUSE_BIN=/opt/ch/clickhouse \\
+CLICKHOUSE_CLIENT=/opt/ch/clickhouse-client \\
+CLICKHOUSE_CONFIG=/opt/ch/config.xml \\
+CLICKHOUSE_NUMA_NODE=2 \\
+CLICKHOUSE_NUMA_CPUS=64-95 \\
+SERVER_HOST=db-host \\
+CLIENT_HOST=ycsb-host \\
+JDBC_URL='jdbc:mysql://10.0.0.1:9004/ycsb' \\
+{str(ROOT / "tools" / "run-clickhouse-numa-suite.sh")} --print-config
+"""
+        result = subprocess.run(["bash", "-lc", script], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("CONFIG=/tmp/clickhouse.env", result.stdout)
+        self.assertIn("SUITE_NAME=clickhouse-suite", result.stdout)
+        self.assertIn("SUITE_LOADS=small:t2:1:2", result.stdout)
+        self.assertIn("SUITE_ROUNDS=2", result.stdout)
+        self.assertIn("SUITE_PROFILES=baseline numa_node1", result.stdout)
+        self.assertIn("CLICKHOUSE_BIN=/opt/ch/clickhouse", result.stdout)
+        self.assertIn("CLICKHOUSE_CLIENT=/opt/ch/clickhouse-client", result.stdout)
+        self.assertIn("CLICKHOUSE_CONFIG=/opt/ch/config.xml", result.stdout)
+        self.assertIn("CLICKHOUSE_NUMA_NODE=2", result.stdout)
+        self.assertIn("CLICKHOUSE_NUMA_CPUS=64-95", result.stdout)
+        self.assertIn("SERVER_HOST=db-host", result.stdout)
+        self.assertIn("CLIENT_HOST=ycsb-host", result.stdout)
+        self.assertIn("JDBC_URL=jdbc:mysql://10.0.0.1:9004/ycsb", result.stdout)
 
 
 if __name__ == "__main__":

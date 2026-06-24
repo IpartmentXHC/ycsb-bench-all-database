@@ -114,11 +114,20 @@ yba_write_meta_common() {
     numactl --hardware > "$run_dir/meta/numactl-hardware.txt" 2>&1 || true
     {
         echo "MODE=$MODE"
+        echo "DB_TYPE=$DB_TYPE"
         echo "SERVER_HOST=$SERVER_HOST"
         echo "CLIENT_HOST=$CLIENT_HOST"
         echo "YCSB_HOME=$YCSB_HOME"
         echo "JDBC_URL=$JDBC_URL"
         echo "TABLE=$TABLE"
+        echo "CLICKHOUSE_BIN=$CLICKHOUSE_BIN"
+        echo "CLICKHOUSE_CLIENT=$CLICKHOUSE_CLIENT"
+        echo "CLICKHOUSE_CONFIG=$CLICKHOUSE_CONFIG"
+        echo "CLICKHOUSE_HOST=$CLICKHOUSE_HOST"
+        echo "CLICKHOUSE_TCP_PORT=$CLICKHOUSE_TCP_PORT"
+        echo "CLICKHOUSE_MYSQL_PORT=$CLICKHOUSE_MYSQL_PORT"
+        echo "CLICKHOUSE_MODE=$CLICKHOUSE_MODE"
+        echo "CLICKHOUSE_NUMA_NODE=$CLICKHOUSE_NUMA_NODE"
         echo "ENABLE_CGROUP=$ENABLE_CGROUP"
         echo "SERVER_CGROUP=$SERVER_CGROUP"
         echo "CLIENT_CGROUP=$CLIENT_CGROUP"
@@ -130,6 +139,7 @@ yba_write_meta_common() {
         echo "THREAD_CLUSTER_REQUIRE_STABLE=$THREAD_CLUSTER_REQUIRE_STABLE"
         echo "THREAD_CLUSTER_DEFAULT_NAME=$THREAD_CLUSTER_DEFAULT_NAME"
         echo "THREAD_CLUSTER_DEFAULT_CPUS=$THREAD_CLUSTER_DEFAULT_CPUS"
+        echo "THREAD_CLUSTER_TASKSET_WITH_SUDO=$THREAD_CLUSTER_TASKSET_WITH_SUDO"
     } > "$run_dir/meta/config-effective.env"
     if [ "$ENABLE_CGROUP" = "1" ]; then
         {
@@ -243,7 +253,25 @@ yba_run_ycsb_clients() {
             rc=1
         fi
     done < "$run_dir/meta/ycsb-shell-pids.txt"
+    if yba_ycsb_logs_have_failures "$run_dir"; then
+        echo "ERROR: YCSB reported failed operations; see $run_dir/metrics/ycsb-raw" >&2
+        rc=1
+    fi
     return "$rc"
+}
+
+yba_ycsb_logs_have_failures() {
+    local run_dir=$1
+    local log
+    shopt -s nullglob
+    for log in "$run_dir"/metrics/ycsb-raw/client-*.log; do
+        if grep -Eq '^\[READ-FAILED\]|^\[READ\], Return=NOT_FOUND, [1-9][0-9]*|Error in database operation|DBException|SQLNonTransientConnectionException|Connection refused|Code: [0-9]+|Exception' "$log"; then
+            shopt -u nullglob
+            return 0
+        fi
+    done
+    shopt -u nullglob
+    return 1
 }
 
 yba_collect_server_logs() {

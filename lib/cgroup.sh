@@ -315,7 +315,7 @@ yba_snapshot_thread_cluster_matches() {
     local rules_file="$dir/thread-cluster/rules.tsv"
     [ -f "$rules_file" ] || rules_file=$(yba_thread_cluster_rules_file "$dir")
     local out="$dir/thread-cluster/${phase}-matches.csv"
-    echo "phase,rule,pid,tid,comm,target_cpus,psr,on_target_cpu" > "$out"
+    echo "phase,rule,pid,tid,comm,target_cpus,psr,affinity_cpus,on_target_cpu" > "$out"
     local actions_file="$dir/thread-cluster/actions.csv"
     local pid rule regex cpus tid comm psr on_target pid_actions pid_threads
     if [ -f "$actions_file" ]; then
@@ -344,8 +344,21 @@ yba_snapshot_thread_cluster_matches() {
                     if (!(tid in psr)) {
                         next
                     }
-                    on_target = cpu_in_list(psr[tid], target)
-                    printf "%s,%s,%s,%s,%s,%s,%s,%s\n", phase, rule, pid, tid, comm[tid], target, psr[tid], on_target
+                    affinity = affinity_list(tid)
+                    on_target = affinity_nonempty_subset(affinity, target)
+                    printf "%s,%s,%s,%s,%s,%s,%s,%s,%s\n", phase, rule, pid, tid, comm[tid], target, psr[tid], affinity, on_target
+                }
+                function affinity_list(tid, cmd, line, n, parts) {
+                    cmd = "taskset -pc " tid " 2>/dev/null"
+                    line = ""
+                    while ((cmd | getline line) > 0) {}
+                    close(cmd)
+                    n = split(line, parts, ":")
+                    if (n < 2) {
+                        return ""
+                    }
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", parts[2])
+                    return parts[2]
                 }
                 function cpu_in_list(cpu, list, parts, n, i, bounds) {
                     n = split(list, parts, ",")
@@ -360,6 +373,25 @@ yba_snapshot_thread_cluster_matches() {
                         }
                     }
                     return 0
+                }
+                function affinity_nonempty_subset(affinity, target, parts, n, i, bounds, cpu) {
+                    if (affinity == "") {
+                        return cpu_in_list(psr[tid], target)
+                    }
+                    n = split(affinity, parts, ",")
+                    for (i = 1; i <= n; i++) {
+                        if (parts[i] ~ /-/) {
+                            split(parts[i], bounds, "-")
+                            for (cpu = bounds[1]; cpu <= bounds[2]; cpu++) {
+                                if (!cpu_in_list(cpu, target)) {
+                                    return 0
+                                }
+                            }
+                        } else if (!cpu_in_list(parts[i], target)) {
+                            return 0
+                        }
+                    }
+                    return 1
                 }
             ' "$pid_actions" >> "$out"
             rm -f "$pid_actions" "$pid_threads"
@@ -376,7 +408,7 @@ yba_snapshot_thread_cluster_matches() {
                     if yba_cpu_in_list "$psr" "$cpus"; then
                         on_target=1
                     fi
-                    printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$phase" "$rule" "$pid" "$tid" "$comm" "$cpus" "$psr" "$on_target" >> "$out"
+                    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$phase" "$rule" "$pid" "$tid" "$comm" "$cpus" "$psr" "" "$on_target" >> "$out"
                 done
         done
     done < "$rules_file"
@@ -397,7 +429,7 @@ yba_thread_cluster_summarize_rule() {
         FNR > 1 && $2 == rule {
             after[$4] = 1
             after_count++
-            if ($8 == "1") {
+            if ($9 == "1") {
                 on_target++
             }
         }
@@ -432,6 +464,20 @@ yba_thread_cluster_rule_is_strict() {
         fi
     done
     return 1
+}
+
+yba_thread_cluster_taskset() {
+    local cpus=$1
+    local tid=$2
+    if [ "${THREAD_CLUSTER_TASKSET_WITH_SUDO:-0}" = "1" ]; then
+        if [ -n "${SUDO_ASKPASS:-}" ]; then
+            SUDO_ASKPASS="$SUDO_ASKPASS" sudo -A taskset -pc "$cpus" "$tid"
+        else
+            sudo taskset -pc "$cpus" "$tid"
+        fi
+    else
+        taskset -pc "$cpus" "$tid"
+    fi
 }
 
 yba_check_thread_cluster_static() {
@@ -502,7 +548,7 @@ yba_apply_thread_cluster() {
                     fi
                     echo "$name pid=$pid tid=$tid cpus=$cpus" >> "$dir/thread-cluster/actions.log"
                     status=bound
-                    taskset -pc "$cpus" "$tid" >> "$dir/thread-cluster/actions.log" 2>&1 || status=failed
+                    yba_thread_cluster_taskset "$cpus" "$tid" >> "$dir/thread-cluster/actions.log" 2>&1 || status=failed
                     printf '%s,%s,%s,%s,%s,%s\n' "$name" "$pid" "$tid" "$comm" "$cpus" "$status" >> "$dir/thread-cluster/actions.csv"
                     if [ "$name" != "$default_name" ]; then
                         printf '%s:%s\n' "$pid" "$tid" >> "$matched_file"

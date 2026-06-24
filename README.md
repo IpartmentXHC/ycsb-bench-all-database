@@ -1,6 +1,6 @@
 # ycsb-bench-all-database
 
-`ycsb-bench-all-database` 是面向 Doris 和 ClickHouse 的 YCSB 压测工具。当前主线优先服务 Doris：固定沉淀 `kunpen183` / `ubuntu197` 上的单机、双机、cgroup v2 cpuset 隔离和用户态线程聚集实验流程。ClickHouse 目前保留同样的配置骨架，等连接参数和启停方式明确后再补齐可直接运行的示例。
+`ycsb-bench-all-database` 是面向 Doris 和 ClickHouse 的 YCSB 压测工具。当前已固定沉淀 `kunpen183` / `ubuntu197` 上的 Doris 单机、双机、cgroup v2 cpuset 隔离和用户态线程聚集实验流程；ClickHouse 支持双机 baseline/NUMA 对照测试。
 
 工具仍然通过 JDBC/YCSB 执行 workload，但项目目标不再是“任意数据库通用压测框架”，而是把 Doris/ClickHouse 的可复现实验流程做稳。
 
@@ -219,27 +219,57 @@ CGROUP_PROCS_WRITE_WITH_SUDO=1
 
 ## ClickHouse
 
-ClickHouse 本轮只提供模板：
+ClickHouse 双机 baseline 配置已经固化：
 
 ```text
-examples/clickhouse/singlehost-baseline.env.example
-examples/clickhouse/dualhost-baseline.env.example
+examples/clickhouse/dualhost-baseline.env
 ```
 
-使用前需要补齐：
+默认使用旧 ClickHouse YCSB 脚本验证过的访问方式：YCSB 通过 MySQL JDBC driver 访问 ClickHouse MySQL 兼容端口 `9004`，服务端 readiness 使用 native `clickhouse-client` 访问 `9000`。
 
 ```bash
-DB_TYPE=clickhouse
-JDBC_URL='jdbc:clickhouse://<host>:8123/ycsb'
-JDBC_DRIVER=com.clickhouse.jdbc.ClickHouseDriver
-JDBC_JAR=/path/to/clickhouse-jdbc.jar
-SERVER_SETUP_CMD='...'
-SERVER_READY_CMD='...'
-SERVER_CLEANUP_CMD='...'
-SERVER_PID_COMMAND='pgrep -x clickhouse-server'
+./bin/yba preflight --config examples/clickhouse/dualhost-baseline.env
+MATRIX='t1:1:1' OPERATIONCOUNT_PER_CLIENT=1000 \
+  ./bin/yba run --config examples/clickhouse/dualhost-baseline.env
 ```
 
-如果没有设置 ClickHouse 的启停 hook，preflight 会直接失败并提示补齐。
+默认路径来自旧实验脚本：
+
+```bash
+CLICKHOUSE_BIN=/home/xhc/clickhouse/ClickHouse/build/programs/clickhouse
+CLICKHOUSE_CLIENT=/home/xhc/clickhouse/ClickHouse/build/programs/clickhouse-client
+CLICKHOUSE_CONFIG=/home/xhc/clickhouse/etc/config.xml
+CLICKHOUSE_TCP_PORT=9000
+CLICKHOUSE_MYSQL_PORT=9004
+JDBC_URL='jdbc:mysql://192.168.70.183:9004/ycsb?...'
+```
+
+正式 NUMA 对照 suite：
+
+```bash
+tools/run-clickhouse-numa-suite.sh --print-config
+tools/run-clickhouse-numa-suite.sh
+```
+
+默认 suite 包含：
+
+- `baseline`
+- `numa_node1`
+- `t16:t16:1:16`
+- `t80:t80:5:16`
+- `3` 轮
+
+输出位于：
+
+```text
+experiments/<suite>/
+  runs/*/summary.csv
+  clickhouse-numa-suite-summary.csv
+  clickhouse-numa-suite-summary-by-profile-load.csv
+  clickhouse-numa-suite-report-cn.md
+```
+
+ClickHouse 默认启停可以通过 `CLICKHOUSE_MODE=unrestricted|node1|nodes:<list>` 控制；如需完全自定义，也可以继续设置 `SERVER_SETUP_CMD` / `SERVER_READY_CMD` / `SERVER_CLEANUP_CMD` 覆盖默认行为。
 
 ## Output
 
